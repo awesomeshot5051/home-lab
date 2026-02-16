@@ -1,0 +1,24 @@
+[Unit]
+Description=License database two-way sync
+Documentation=https://your.internal.docs/if-any
+# Wait for network and for EITHER of the two heartbeat services
+After=network-online.target heartbeat-controller.service heartbeat.service
+Wants=network-online.target
+
+# This clever condition makes the service only start when at least one of them is active
+ExecStartPre=/bin/bash -c "systemctl is-active --quiet heartbeat-controller.service || systemctl is-active --quiet heartbeat.service"
+
+[Service]
+Type=oneshot
+# Run the sync script
+ExecStart=/usr/local/bin/sync_license_db
+
+# Also keep your traditional log file happy
+ExecStartPost=/usr/bin/tail -n50 /var/log/license_db_sync.log > /dev/null
+
+# If the script fails → try again in 5 minutes (optional but nice)
+Restart=on-failure
+RestartSec=300
+
+StandardOutput=journal
+StandardError=journal

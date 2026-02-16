@@ -1,0 +1,20 @@
+[Unit]
+Description=Heartbeat Controller (Java)
+After=network.target
+
+[Service]
+ExecStart=/home/awesomeshot5051/.sdkman/candidates/java/current/bin/java HeartbeatController
+WorkingDirectory=/usr/local/bin/heartbeat_server
+Restart=on-failure
+
+User=root
+
+StandardOutput=append:/var/log/hb-controller.log
+StandardError=append:/var/log/hb-controller-error.log
+KillMode=process
+# Controller also shuts down normally with 143
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target
+

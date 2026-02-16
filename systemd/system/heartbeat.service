@@ -1,0 +1,25 @@
+[Unit]
+Description=Heartbeat UDP Server
+After=network.target
+
+[Service]
+Type=simple
+
+# Start HeartbeatServer Java program
+ExecStart=/home/awesomeshot5051/.sdkman/candidates/java/current/bin/java HeartbeatServer -v
+
+# Heartbeat exits naturally on timeout → do NOT restart
+Restart=no
+
+User=root
+WorkingDirectory=/usr/local/bin/heartbeat_server
+
+StandardOutput=append:/var/log/heartbeat.log
+StandardError=append:/var/log/heartbeat.log
+
+# Java returns 143 when killed → treat as normal
+SuccessExitStatus=143
+KillMode=process
+[Install]
+WantedBy=multi-user.target
+

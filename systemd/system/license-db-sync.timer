@@ -1,0 +1,19 @@
+[Unit]
+Description=Run license database sync every 30 minutes
+Requires=license-db-sync.service
+
+[Timer]
+# First run: 30 seconds after boot (plenty of time for heartbeat to start the DB)
+OnBootSec=30sec
+
+# Then every 30 minutes
+OnUnitActiveSec=30min
+
+# If the machine was off when a run was due → run it as soon as it comes back
+Persistent=true
+
+# Randomize start time by up to 2 minutes to avoid thundering herd (optional)
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

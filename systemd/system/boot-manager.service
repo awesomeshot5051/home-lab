@@ -1,0 +1,15 @@
+[Unit]
+Description=Check boot time to determine maintenance mode
+# Wait for time sync so $(date) is accurate
+After=time-sync.target
+# We want this to run after the heartbeat *would* have started
+After=heartbeat-controller.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/boot-manager.sh
+# Ensure it runs with root permissions to stop services/run updates
+User=root
+
+[Install]
+WantedBy=multi-user.target
