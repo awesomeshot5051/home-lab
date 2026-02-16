@@ -1,0 +1,10 @@
+[Unit]
+Description=Prevent sleep
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c "while true; do sleep 300; done"
+
+[Install]
+WantedBy=multi-user.target
+

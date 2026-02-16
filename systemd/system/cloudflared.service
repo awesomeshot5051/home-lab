@@ -1,0 +1,12 @@
+[Unit]
+Description=Cloudflare-DoH-Proxy
+After=network.target
+
+[Service]
+User=cloudflared
+ExecStart=/usr/bin/cloudflared proxy-dns --address 127.0.0.1 --port 5053 --upstream https://1.1.1.1/dns-query --upstream https://1.0.0.1/dns-query
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
