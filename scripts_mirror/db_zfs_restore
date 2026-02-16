@@ -1,0 +1,45 @@
+#!/bin/bash
+# ZFS Restore Script for MariaDB backups
+# Author: Trae England
+
+RESTORE_DATE=$1
+SRC_DIR="/vaultbackup/mariadb_backups"
+DEST_DIR="/vaultdb/mariadb"
+LOGFILE="/var/log/zfs_restore.log"
+
+if [ -z "$RESTORE_DATE" ]; then
+    echo "Usage: $0 <date or partial date>"
+    exit 1
+fi
+
+ZIPFILE=$(ls ${SRC_DIR}/mariadb_backup_*${RESTORE_DATE}*.zip 2>/dev/null | head -n 1)
+
+if [ -z "$ZIPFILE" ]; then
+    echo "[$(date)] No backup archive found matching '${RESTORE_DATE}'." | tee -a $LOGFILE
+    exit 1
+fi
+
+echo "[$(date)] Found backup: ${ZIPFILE}" | tee -a $LOGFILE
+
+# Stop MariaDB before restoring
+systemctl stop mariadb
+echo "MariaDB stopped." | tee -a $LOGFILE
+
+# Mount destination dataset (if not already)
+mkdir -p "$DEST_DIR"
+
+# Clean existing files (keep the directory structure intact)
+rm -rf ${DEST_DIR:?}/*
+
+# Extract archive
+echo "Extracting ${ZIPFILE} to ${DEST_DIR}..." | tee -a $LOGFILE
+unzip -q ${ZIPFILE} -d ${DEST_DIR}
+
+# Fix permissions
+chown -R mysql:mysql ${DEST_DIR}
+chmod 750 ${DEST_DIR}
+
+# Start MariaDB
+systemctl start mariadb
+echo "MariaDB restored and started successfully from ${ZIPFILE}" | tee -a $LOGFILE
+

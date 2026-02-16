@@ -1,0 +1,33 @@
+#!/bin/bash
+DATE=$(date +%F)
+SRCPOOL="vaultdb/mariadb"
+BACKUPDIR="/vaultbackup/mariadb_backups"
+LOGFILE="/var/log/zfs_backup.log"
+
+echo "[$(date)] Starting check..." >> $LOGFILE
+
+# Get the most recent snapshot
+PREV_SNAP=$(zfs list -H -o name -t snapshot -s creation | grep "${SRCPOOL}@" | tail -n1)
+
+# Compare the most recent snapshot to the current live dataset
+if [ -n "$PREV_SNAP" ]; then
+    zfs diff -FH $PREV_SNAP $SRCPOOL > /tmp/zfs_diff.txt 2>/dev/null
+    if [ ! -s /tmp/zfs_diff.txt ]; then
+        echo "[$(date)] No changes detected. Skipping snapshot." >> $LOGFILE
+        rm /tmp/zfs_diff.txt
+        exit 0
+    fi
+fi
+
+echo "[$(date)] Changes detected. Creating new snapshot ${SRCPOOL}@${DATE}." >> $LOGFILE
+zfs snapshot ${SRCPOOL}@${DATE}
+
+# Keep only last 3 snapshots
+SNAP_COUNT=$(zfs list -H -o name -t snapshot | grep "${SRCPOOL}@" | wc -l)
+if [ $SNAP_COUNT -gt 3 ]; then
+    zfs list -H -o name -t snapshot -s creation | grep "${SRCPOOL}@" | head -n -3 | xargs -n1 zfs destroy
+    echo "[$(date)] Cleaned up old snapshots. Keeping last 3." >> $LOGFILE
+fi
+
+rm -f /tmp/zfs_diff.txt
+echo "[$(date)] Done." >> $LOGFILE
