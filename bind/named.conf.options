@@ -1,0 +1,17 @@
+options {
+    directory "/var/cache/bind";
+
+    forwarders {
+        192.168.1.254;
+	192.168.0.110;
+    };
+
+    dnssec-validation auto;
+    allow-query { 192.168.0.0/24; localhost; };
+    listen-on { 127.0.0.1; 192.168.0.197; }; // LAN IP of this server
+    listen-on-v6 { none; };
+    recursion yes;
+    allow-recursion { 192.168.0.0/24; localhost; };
+
+};
+
