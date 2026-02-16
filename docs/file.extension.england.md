@@ -15,7 +15,7 @@ This server provides redundancy for the core network while introducing a securit
 | :--- | :--- | :--- |
 | **Secondary DNS** | `named.service` | BIND9 instance acting as the secondary authority for the local domain. |
 | **Pi-hole FTL** | `pihole-FTL.service` | DNS-level ad-blocking and network-wide privacy protection. |
-| **iSCSI Initiator** | `iscsid.service` | Manages connections to remote iSCSI targets (likely the primary file server). |
+| **iSCSI Initiator** | `iscsid.service` | Manages connections to remote iSCSI targets. |
 
 ---
 
