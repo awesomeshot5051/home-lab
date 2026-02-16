@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily Netplan Apply
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/netplan apply

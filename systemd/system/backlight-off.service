@@ -1,0 +1,11 @@
+[Unit]
+Description=Turn off laptop backlight at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > /sys/class/backlight/amdgpu_bl1/brightness'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

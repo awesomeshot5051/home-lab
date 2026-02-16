@@ -1,0 +1,21 @@
+[Unit]
+Description=SearXNG Search Engine (Docker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+
+ExecStart=/usr/bin/docker run --rm --name searxng \
+  --network host \
+  -e SEARXNG_PORT=8080 \
+  -v /etc/searxng:/etc/searxng \
+  -v /var/lib/searxng:/var/lib/searxng \
+  searxng/searxng:latest
+
+ExecStop=/usr/bin/docker stop searxng
+
+[Install]
+WantedBy=multi-user.target

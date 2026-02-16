@@ -1,0 +1,16 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno1:
+      dhcp4: true
+      # This static address is fine to keep as an alias
+      addresses:
+        - 192.168.10.140/24
+      nameservers:
+        addresses: [192.168.0.110, 192.168.0.197, 192.168.0.1]
+      # Only keep routes that DHCP does NOT provide
+      routes:
+        - to: 192.168.1.0/24
+          via: 192.168.1.254
+          on-link: true

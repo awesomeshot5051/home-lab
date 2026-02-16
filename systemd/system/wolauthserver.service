@@ -1,0 +1,18 @@
+[Unit]
+Description=WoL Authentication Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/WolAuthServer
+ExecStart=/usr/bin/java -cp /WolAuthServer WolAuthServer
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/wolauthserver.log
+StandardError=append:/var/log/wolauthserver-error.log
+
+[Install]
+WantedBy=multi-user.target
+

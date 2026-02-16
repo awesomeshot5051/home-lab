@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Netplan Apply daily at 8:05
+
+[Timer]
+# Format: Year-Month-Day Hour:Minute:Second
+OnCalendar=*-*-* 08:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

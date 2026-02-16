@@ -1,0 +1,26 @@
+### Editing /etc/systemd/system/wolauthserver.service.d/override.conf
+### Anything between here and the comment below will become the contents of the drop-in file
+
+
+
+### Edits below this comment will be discarded
+
+
+### /etc/systemd/system/wolauthserver.service
+# [Unit]
+# Description=WoL Authentication Server
+# After=network-online.target
+# Wants=network-online.target
+# 
+# [Service]
+# Type=simple
+# User=root
+# WorkingDirectory=/WolAuthServer
+# ExecStart=/usr/bin/java -cp /WolAuthServer WolAuthServer
+# Restart=always
+# RestartSec=5
+# StandardOutput=append:/var/log/wolauthserver.log
+# StandardError=append:/var/log/wolauthserver-error.log
+# 
+# [Install]
+# WantedBy=multi-user.target
