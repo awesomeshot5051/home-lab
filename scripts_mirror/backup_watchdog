@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+sleep 1800  # wait 30 minutes
+
+# Check if ZFS send is still running
+BACKUP_PID=$(pgrep -f "zfs send" || true)
+
+if [[ -n "$BACKUP_PID" ]]; then
+    echo "Backup still running after 30 minutes, extending no-suspend by 30 minutes."
+    /usr/local/bin/disablesuspend 30min &
+fi
+

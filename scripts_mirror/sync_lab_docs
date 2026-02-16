@@ -1,0 +1,43 @@
+#!/bin/bash
+# Location: /usr/local/bin/sync_lab_docs.sh
+# Description: Orchestrates the nightly documentation sync to traes-pc
+
+PC_IP="192.168.0.135" # Update to your PC's actual IP
+LANDING_ZONE="/mnt/MergedStorage/lab_sync_temp"
+# Note: Ensure you have SSH keys set up between File Server -> traes-pc
+TARGET="awesomeshot5051@$PC_IP:/home/awesomeshot5051/Documents/homeLabDocumentation/docs/serverChangelogs/"
+
+# 1. Check if PC is awake
+if ! ping -c 1 -W 1 "$PC_IP" > /dev/null; then
+    echo "[$(date)] PC is offline. Requesting wake from network.england..."
+    # Call your existing script on the network server
+    ssh awesomeshot5051@network.england "/usr/local/bin/wake_pc"
+    
+    # Wait for heartbeat (Max 5 minutes)
+    TIMEOUT=30
+    COUNT=0
+    while ! ping -c 1 -W 1 "$PC_IP" > /dev/null; do
+        if [ $COUNT -ge $TIMEOUT ]; then 
+            echo "[$(date)] ERROR: PC failed to wake within 5 minutes."
+            exit 1 
+        fi
+        sleep 10
+        ((COUNT++))
+    done
+    echo "[$(date)] PC heartbeat detected. Waiting for SSH services..."
+    sleep 15 # Buffer for SSH daemon to start after boot
+fi
+
+# 2. Push to traes-pc
+# -a: archive mode, -v: verbose, -z: compress during transfer
+# --relative: keeps the folder structure (vpn.server.england/, etc.)
+echo "[$(date)] Starting rsync to traes-pc..."
+rsync -avz "$LANDING_ZONE/" "$TARGET"
+
+if [ $? -eq 0 ]; then
+    echo "[$(date)] Sync successful."
+    # Optional: Clear landing zone so tomorrow is fresh
+    # rm -rf ${LANDING_ZONE}/*
+else
+    echo "[$(date)] Sync failed."
+fi

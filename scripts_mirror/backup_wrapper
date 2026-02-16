@@ -1,0 +1,13 @@
+#!/bin/bash
+
+DAY_OF_YEAR=$(date +%j)
+if (( DAY_OF_YEAR % 3 != 0 )); then
+    echo "Skipping backup today (not the 3-day interval)."
+    exit 0
+fi
+
+# Disable suspend for 1 hour to cover backup time
+/usr/local/bin/disablesuspend 1 hr
+
+# Run backup inside systemd-inhibit to be extra sure
+systemd-inhibit --what=sleep --why="Backup running" /usr/local/bin/backup_fileserver

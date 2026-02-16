@@ -1,0 +1,70 @@
+#!/bin/bash
+set -euo pipefail
+
+# Full paths
+ZFS_BIN="/sbin/zfs"
+ZSTD_BIN="/usr/bin/zstd"
+DISABLESUSPEND_BIN="/usr/local/bin/disablesuspend"
+WATCHER_BIN="/usr/local/bin/backup_watchdog"
+
+# Parse optional args
+FORCE=false
+for arg in "$@"; do
+    case "$arg" in
+        -F|-Force) FORCE=true ;;
+    esac
+done
+
+# Only run every 3rd day unless forced
+DAY_OF_YEAR=$(date +%j)
+if ! $FORCE && (( DAY_OF_YEAR % 3 != 0 )); then
+    echo "Skipping backup today (not the 3-day interval)."
+    exit 0
+fi
+
+# Configuration
+POOL="storage"    # ZFS pool
+                  # Dataset
+BACKUP_PATH="/mnt/backup_data"  # Samba mount
+
+# Check mount
+if ! mountpoint -q "$BACKUP_PATH"; then
+    echo "$BACKUP_PATH is not mounted! Exiting."
+    exit 1
+fi
+
+# Snapshot name
+DATE=$(date +%Y-%m-%d)
+SNAP="${POOL}@$DATE"
+
+# Create snapshot
+"$ZFS_BIN" snapshot "$SNAP"
+
+# Disable suspend for 1 hour
+"$DISABLESUSPEND_BIN" 1 hr &
+
+# Start watcher to extend disable-suspend if backup runs long
+"$WATCHER_BIN" &
+
+# Send snapshot to Samba share (compressed)
+OUTFILE="${BACKUP_PATH}/storage_$DATE.zst"
+"$ZFS_BIN" send "$SNAP" | "$ZSTD_BIN" -T0 -19 > "$OUTFILE"
+
+# Rotate old backups on the Samba share (max 3)
+BACKUPS=( $(ls -1t "$BACKUP_PATH/${DATASET}"_*.zst 2>/dev/null || true) )
+if (( ${#BACKUPS[@]} > 3 )); then
+    TO_DELETE=( "${BACKUPS[@]:3}" )
+    echo "Removing old backups: ${TO_DELETE[*]}"
+    rm -f "${TO_DELETE[@]}"
+fi
+
+# Rotate old snapshots on the ZFS pool (max 3)
+OLD_SNAPSHOTS=( $( "$ZFS_BIN" list -H -t snapshot -o name -s creation | grep "^${POOL}/${DATASET}@" ) )
+if (( ${#OLD_SNAPSHOTS[@]} > 3 )); then
+    for SNAP_DEL in "${OLD_SNAPSHOTS[@]:0:${#OLD_SNAPSHOTS[@]}-3}"; do
+        "$ZFS_BIN" destroy "$SNAP_DEL"
+    done
+fi
+
+echo "Backup completed successfully: $DATE"
+

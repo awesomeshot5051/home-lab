@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# Compare two directories for equality of files + metadata + content hashes.
+# Modes:
+#   --ab       : verify all files in A exist/match in B
+#   --ba       : verify all files in B exist/match in A
+#   --m|--mirror : verify exact mirror (both directions)
+# 
+# Comparison Options (can be combined):
+#   -a  : all comparisons (permissions, hashes, name, modified, size, gid, uid)
+#   -A  : practical all (permissions, hashes, name, size - skips uid/gid/mtime)
+#   -p  : permissions
+#   -h  : hashes (content comparison)
+#   -n  : name (default if no options specified)
+#   -m  : modified time
+#   -s  : size
+#   -g  : gid (group ID) - often changes between systems/mounts
+#   -u  : uid (user ID) - often changes between systems/mounts
+#   Can combine: -phs for permissions+hashes+size only
+#
+# Verbosity:
+#   -v  : print files as they are checked
+#   -vv : also print the result of each check
+#
+# Usage:
+#   ./compare_dirs.sh [--ab|--ba|--m|--mirror] [-A|-a|-p|-h|-n|-m|-s|-g|-u] [-v|-vv] /path/to/dirA /path/to/dirB
+
+set -o pipefail
+
+verbose=0
+mode=""
+check_permissions=0
+check_hashes=0
+check_name=1  # Default to name only
+check_modified=0
+check_size=0
+check_gid=0
+check_uid=0
+
+# ---- parse options ----
+while [[ "$1" == -* ]]; do
+  case "$1" in
+    --ab) mode="a-in-b" ;;
+    --ba) mode="b-in-a" ;;
+    --m|--mirror) mode="mirror" ;;
+    -v) verbose=1 ;;
+    -vv) verbose=2 ;;
+    -a)
+      # All comparisons including uid/gid/mtime
+      check_permissions=1
+      check_hashes=1
+      check_name=1
+      check_modified=1
+      check_size=1
+      check_gid=1
+      check_uid=1
+      ;;
+    -A)
+      # Practical all - skip problematic uid/gid/mtime
+      check_permissions=1
+      check_hashes=1
+      check_name=1
+      check_size=1
+      check_modified=0
+      check_gid=0
+      check_uid=0
+      ;;
+    -*)
+      # Handle combined flags
+      check_name=0  # Turn off default when explicit flags are used
+      flags="${1#-}"
+      for ((i=0; i<${#flags}; i++)); do
+        case "${flags:$i:1}" in
+          A) 
+            # Practical all - skip problematic uid/gid/mtime
+            check_permissions=1
+            check_hashes=1
+            check_name=1
+            check_size=1
+            ;;
+          a) 
+            # True all including uid/gid/mtime
+            check_permissions=1
+            check_hashes=1
+            check_name=1
+            check_modified=1
+            check_size=1
+            check_gid=1
+            check_uid=1
+            ;;
+          p) check_permissions=1 ;;
+          h) check_hashes=1 ;;
+          n) check_name=1 ;;
+          m) check_modified=1 ;;
+          s) check_size=1 ;;
+          g) check_gid=1 ;;
+          u) check_uid=1 ;;
+          v) 
+            if [[ $verbose -eq 0 ]]; then
+              verbose=1
+            elif [[ $verbose -eq 1 ]]; then
+              verbose=2
+            fi
+            ;;
+          *) echo "Unknown flag: ${flags:$i:1}" >&2; exit 1 ;;
+        esac
+      done
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$mode" ]]; then
+  echo "Error: You must specify one of --ab, --ba, or --m|--mirror." >&2
+  exit 1
+fi
+
+# ---- validate args ----
+if [[ $# -ne 2 ]]; then
+  echo "Usage: $0 [--ab|--ba|--m|--mirror] [-A|-a|-p|-h|-n|-m|-s|-g|-u] [-v|-vv] <dirA> <dirB>" >&2
+  echo "  -A : practical all (permissions+hashes+name+size, skips uid/gid/mtime)"
+  echo "  -a : true all (includes uid/gid/mtime - may cause false positives across systems)" >&2
+  exit 1
+fi
+
+# Normalize directories (remove trailing slashes, resolve . and ..)
+if ! dirA="$(realpath -m "$1")"; then echo "Invalid dirA: $1" >&2; exit 1; fi
+if ! dirB="$(realpath -m "$2")"; then echo "Invalid dirB: $2" >&2; exit 1; fi
+if [[ ! -d "$dirA" || ! -d "$dirB" ]]; then
+  echo "Both arguments must be directories." >&2
+  exit 1
+fi
+
+# ---- counters ----
+count_checked=0
+count_matched=0
+count_missing=0
+
+# Detailed mismatch counters
+count_perm_mismatch=0
+count_uid_mismatch=0
+count_gid_mismatch=0
+count_size_mismatch=0
+count_mtime_mismatch=0
+count_hash_mismatch=0
+count_stat_error=0
+
+# Print helper respecting verbosity
+vprint() { [[ $verbose -ge 1 ]] && echo "$*"; }
+vvprint() { [[ $verbose -ge 2 ]] && echo "$*"; }
+
+# Compare metadata fields, emit reasons on -vv
+compare_metadata() {
+  local src="$1" tgt="$2"
+  # Numeric UID/GID to avoid name mapping issues; perms, size, mtime
+  local fmt="%a %u %g %s %Y"
+  local s_out t_out
+  if ! s_out=$(stat -c "$fmt" -- "$src" 2>/dev/null); then
+    echo "__SRC_STAT_FAIL__"
+    return 3
+  fi
+  if ! t_out=$(stat -c "$fmt" -- "$tgt" 2>&1); then
+    # Bubble up the error text so caller can distinguish missing vs perms
+    echo "__TGT_STAT_FAIL__:$t_out"
+    return 4
+  fi
+
+  # Split fields
+  read -r s_perm s_uid s_gid s_size s_mtime <<<"$s_out"
+  read -r t_perm t_uid t_gid t_size t_mtime <<<"$t_out"
+
+  local reasons=()
+  local has_mismatch=0
+
+  if [[ $check_permissions -eq 1 && "$s_perm" != "$t_perm" ]]; then
+    reasons+=("perm $s_perm!=$t_perm")
+    ((count_perm_mismatch++))
+    has_mismatch=1
+  fi
+  
+  if [[ $check_uid -eq 1 && "$s_uid" != "$t_uid" ]]; then
+    reasons+=("uid $s_uid!=$t_uid")
+    ((count_uid_mismatch++))
+    has_mismatch=1
+  fi
+  
+  if [[ $check_gid -eq 1 && "$s_gid" != "$t_gid" ]]; then
+    reasons+=("gid $s_gid!=$t_gid")
+    ((count_gid_mismatch++))
+    has_mismatch=1
+  fi
+  
+  if [[ $check_size -eq 1 && "$s_size" != "$t_size" ]]; then
+    reasons+=("size $s_size!=$t_size")
+    ((count_size_mismatch++))
+    has_mismatch=1
+  fi
+  
+  if [[ $check_modified -eq 1 && "$s_mtime" != "$t_mtime" ]]; then
+    reasons+=("mtime $s_mtime!=$t_mtime")
+    ((count_mtime_mismatch++))
+    has_mismatch=1
+  fi
+
+  if [[ $has_mismatch -eq 1 ]]; then
+    echo "Metadata mismatch: ${reasons[*]}"
+    return 1
+  fi
+
+  echo "OK"
+  return 0
+}
+
+check_dir() {
+  local source_dir="$1"
+  local target_dir="$2"
+  local label="$3"
+
+  while IFS= read -r -d '' file_src; do
+    # robust relative path (handles trailing slashes and weird paths)
+    local rel_path
+    rel_path=$(realpath -m --relative-to="$source_dir" -- "$file_src")
+    local file_tgt="$target_dir/$rel_path"
+
+    ((count_checked++))
+    vprint "Checking ($label): $rel_path"
+
+    # Check if target file exists (name check)
+    if [[ $check_name -eq 1 && ! -f "$file_tgt" ]]; then
+      ((count_missing++))
+      vvprint "  → Missing in target"
+      continue
+    fi
+
+    # Compare metadata if any metadata checks are enabled
+    local file_has_mismatch=0
+    if [[ $check_permissions -eq 1 || $check_uid -eq 1 || $check_gid -eq 1 || $check_size -eq 1 || $check_modified -eq 1 ]]; then
+      local meta_result
+      meta_result=$(compare_metadata "$file_src" "$file_tgt")
+      local meta_rc=$?
+
+      if [[ $meta_rc -eq 4 ]]; then
+        # Target stat failed; decide if missing or permission denied
+        if grep -qi "No such file or directory" <<<"$meta_result"; then
+          if [[ $check_name -eq 0 ]]; then
+            # Only count as missing if we're not already checking names
+            ((count_missing++))
+            vvprint "  → Missing in target"
+            continue
+          fi
+        else
+          ((count_stat_error++))
+          vvprint "  → $meta_result"
+          file_has_mismatch=1
+        fi
+      elif [[ $meta_rc -eq 3 ]]; then
+        # Source stat failed (unexpected)
+        ((count_stat_error++))
+        vvprint "  → Source stat failed"
+        file_has_mismatch=1
+      elif [[ $meta_rc -eq 1 ]]; then
+        vvprint "  → $meta_result"
+        file_has_mismatch=1
+      fi
+    fi
+
+    # Compare hashes if requested and no fatal errors so far
+    if [[ $check_hashes -eq 1 && $file_has_mismatch -eq 0 ]]; then
+      local hash_src hash_tgt
+      if ! hash_src=$(sha256sum -- "$file_src" 2>/dev/null | awk '{print $1}'); then
+        ((count_stat_error++))
+        vvprint "  → Could not read source for hash"
+        file_has_mismatch=1
+      elif ! hash_tgt=$(sha256sum -- "$file_tgt" 2>&1 | awk '{print $1}'); then
+        # Distinguish permission denied vs other errors
+        if grep -qi "Permission denied" <<<"$hash_tgt"; then
+          ((count_stat_error++))
+          vvprint "  → Permission denied reading target for hash"
+        else
+          ((count_stat_error++))
+          vvprint "  → Hash read failed on target"
+        fi
+        file_has_mismatch=1
+      elif [[ "$hash_src" != "$hash_tgt" ]]; then
+        ((count_hash_mismatch++))
+        vvprint "  → Hash mismatch"
+        file_has_mismatch=1
+      fi
+    fi
+
+    # Final result for this file
+    if [[ $file_has_mismatch -eq 0 ]]; then
+      ((count_matched++))
+      vvprint "  → Match"
+    fi
+
+  done < <(find "$source_dir" -type f -print0)
+}
+
+# Show what we're checking
+echo "Comparison mode: $mode"
+echo -n "Checking: "
+checks=()
+[[ $check_name -eq 1 ]] && checks+=("name")
+[[ $check_permissions -eq 1 ]] && checks+=("permissions")
+[[ $check_uid -eq 1 ]] && checks+=("uid")
+[[ $check_gid -eq 1 ]] && checks+=("gid")
+[[ $check_size -eq 1 ]] && checks+=("size")
+[[ $check_modified -eq 1 ]] && checks+=("modified")
+[[ $check_hashes -eq 1 ]] && checks+=("hashes")
+echo "${checks[*]}"
+echo ""
+
+# ---- run checks ----
+case "$mode" in
+  "a-in-b") check_dir "$dirA" "$dirB" "A→B" ;;
+  "b-in-a") check_dir "$dirB" "$dirA" "B→A" ;;
+  "mirror")
+    check_dir "$dirA" "$dirB" "A→B"
+    check_dir "$dirB" "$dirA" "B→A"
+    ;;
+esac
+
+# ---- detailed summary ----
+echo ""
+echo "===== SUMMARY ====="
+echo "Total checked:     $count_checked"
+echo "Matches:           $count_matched"
+echo ""
+echo "=== MISMATCHES ==="
+[[ $count_missing -gt 0 ]] && echo "Missing files:     $count_missing"
+[[ $count_perm_mismatch -gt 0 ]] && echo "Permission diffs:  $count_perm_mismatch"
+[[ $count_uid_mismatch -gt 0 ]] && echo "UID mismatches:    $count_uid_mismatch"
+[[ $count_gid_mismatch -gt 0 ]] && echo "GID mismatches:    $count_gid_mismatch"
+[[ $count_size_mismatch -gt 0 ]] && echo "Size mismatches:   $count_size_mismatch"
+[[ $count_mtime_mismatch -gt 0 ]] && echo "Modified time:     $count_mtime_mismatch"
+[[ $count_hash_mismatch -gt 0 ]] && echo "Content (hash):    $count_hash_mismatch"
+[[ $count_stat_error -gt 0 ]] && echo "Stat/read errors:  $count_stat_error"
+
+total_mismatches=$((count_missing + count_perm_mismatch + count_uid_mismatch + count_gid_mismatch + count_size_mismatch + count_mtime_mismatch + count_hash_mismatch + count_stat_error))
+echo ""
+echo "Total mismatches:  $total_mismatches"
+echo "==================="
+
+# Exit with error code if there were mismatches
+[[ $total_mismatches -gt 0 ]] && exit 1
+exit 0
