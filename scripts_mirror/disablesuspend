@@ -1,0 +1,44 @@
+#!/bin/bash
+
+LOCKFILE="/tmp/suspend_disabled"
+
+# Default: disable for 24 hours
+if [ -z "$1" ]; then
+    touch "$LOCKFILE"
+    echo "Suspend disabled for today (24 hours)."
+    exit 0
+fi
+
+NUM=$1
+UNIT=${2,,}  # Convert to lowercase
+
+# Default to seconds if no unit
+if [ -z "$UNIT" ]; then
+    SECONDS=$NUM
+else
+    case $UNIT in
+        sec|second|seconds )
+            SECONDS=$NUM
+            ;;
+        min|mins|minute|minutes )
+            SECONDS=$((NUM * 60))
+            ;;
+        hr|hrs|hour|hours )
+            SECONDS=$((NUM * 3600))
+            ;;
+        * )
+            echo "Unsupported time unit: $UNIT"
+            exit 1
+            ;;
+    esac
+fi
+
+touch "$LOCKFILE"
+echo "Suspend disabled for next $SECONDS seconds."
+
+# Convert to minutes for `at` (rounded up)
+MINUTES=$(( (SECONDS + 59) / 60 ))
+
+# Use `at` to re-enable
+echo "rm -f $LOCKFILE" | at now + $MINUTES minutes
+
