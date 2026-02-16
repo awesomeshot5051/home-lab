@@ -1,35 +1,21 @@
 /*
-
 !/.gitignore
-
 !/lynis-suggestions.md
-
 !/systemd/
-
 !/bind/
-
 !/netplan/
-
 !/network/
-
 !/openvpn/
-
 !/ssh/sshd_config
-
-# Safety catch-alls
-
+!/scripts_mirror/
+# Specific sensitive script exclusion
+scripts_mirror/sync_license_db
+# General security blocks
 shadow*
-
 gshadow*
-
 *.key
-
 *.pem
-
 ssh_host_*
-
 *.db*
-
 *.bak
-
 *.sql

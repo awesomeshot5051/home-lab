@@ -1,0 +1,34 @@
+#!/bin/bash
+
+if [ -z "$1" ]; then
+    echo "Usage: suspendfor <amount> [unit: sec|min|hr]"
+    exit 1
+fi
+
+NUM=$1
+UNIT=${2,,}  # Convert to lowercase
+
+# Default to seconds if no unit given
+if [ -z "$UNIT" ]; then
+    SECONDS=$NUM
+else
+    case $UNIT in
+        sec|second|seconds )
+            SECONDS=$NUM
+            ;;
+        min|mins|minute|minutes )
+            SECONDS=$((NUM * 60))
+            ;;
+        hr|hrs|hour|hours )
+            SECONDS=$((NUM * 3600))
+            ;;
+        * )
+            echo "Unsupported time unit: $UNIT"
+            exit 1
+            ;;
+    esac
+fi
+
+echo "Suspending for $SECONDS seconds..."
+sudo rtcwake -m mem -s "$SECONDS"
+
