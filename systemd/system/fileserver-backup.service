@@ -1,0 +1,11 @@
+[Unit]
+Description=File Server Backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=backupuser
+Group=backupuser
+ExecStart=/usr/local/bin/backup_runner
+

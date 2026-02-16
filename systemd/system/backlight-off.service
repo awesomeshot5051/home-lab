@@ -1,0 +1,12 @@
+[Unit]
+Description=Turn off laptop backlight at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > /sys/class/backlight/radeon_bl0/brightness'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+
