@@ -1,5 +1,7 @@
 /*
+!.etckeeper
 !/.gitignore
+!/README.md
 !/lynis-suggestions.md
 !/systemd/
 !/bind/
@@ -8,9 +10,6 @@
 !/openvpn/
 !/ssh/sshd_config
 !/scripts_mirror/
-# Specific sensitive script exclusion
-scripts_mirror/sync_license_db
-# General security blocks
 shadow*
 gshadow*
 *.key
