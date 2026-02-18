@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Define the log file location
+LOG_FILE="/var/log/netplan_apply.log"
+
+# Log the execution time
+echo "=== Executing netplan apply at $(date) ===" >> "$LOG_FILE"
+
+# Run netplan apply using its absolute path to prevent cron PATH issues.
+# Both standard output and standard error are redirected to the log file.
+/usr/sbin/netplan apply >> "$LOG_FILE" 2>&1
+
+# Check the exit status of the netplan command
+if [ $? -eq 0 ]; then
+    echo "Status: Success." >> "$LOG_FILE"
+else
+    echo "Status: FAILED. Check configuration." >> "$LOG_FILE"
+fi
+
+echo "------------------------------------------" >> "$LOG_FILE"
