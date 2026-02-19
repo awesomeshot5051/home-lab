@@ -1,11 +1,11 @@
 [Unit]
-Description=Mount unit for go, revision 11017
+Description=Mount unit for go, revision 11067
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 
 [Mount]
-What=/var/lib/snapd/snaps/go_11017.snap
-Where=/snap/go/11017
+What=/var/lib/snapd/snaps/go_11067.snap
+Where=/snap/go/11067
 Type=squashfs
 Options=nodev,ro,x-gdu.hide,x-gvfs-hide
 LazyUnmount=yes
