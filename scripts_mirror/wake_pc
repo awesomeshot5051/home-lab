@@ -1,1 +1,4 @@
-wakeonlan F0:B2:B9:23:FB:A1
+
+#!/bin/bash
+
+/usr/bin/wakeonlan -i 192.168.0.255 F0:B2:B9:23:FB:A1
