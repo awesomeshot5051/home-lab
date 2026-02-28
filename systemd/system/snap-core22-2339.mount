@@ -1,11 +1,11 @@
 [Unit]
-Description=Mount unit for core22, revision 2216
+Description=Mount unit for core22, revision 2339
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 
 [Mount]
-What=/var/lib/snapd/snaps/core22_2216.snap
-Where=/snap/core22/2216
+What=/var/lib/snapd/snaps/core22_2339.snap
+Where=/snap/core22/2339
 Type=squashfs
 Options=nodev,ro,x-gdu.hide,x-gvfs-hide
 LazyUnmount=yes
