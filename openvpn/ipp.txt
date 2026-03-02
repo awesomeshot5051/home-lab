@@ -1,1 +1,1 @@
-awesomeshot5051-CA,10.8.0.4,
+awesomeshot5051-CA,10.8.0.4,oracle-api-client,10.8.0.2
