@@ -1,0 +1,10 @@
+[Unit]
+Description=Run metrics agent every 15 seconds
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
