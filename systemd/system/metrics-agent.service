@@ -1,0 +1,21 @@
+[Unit]
+Description=Portfolio Metrics Agent
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/metrics-agent.env
+ExecStart=/usr/local/bin/collect-metrics.sh
+
+/etc/systemd/system/metrics-agent.timer
+────────────────────────────────────────
+[Unit]
+Description=Run metrics agent every 15 seconds
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
