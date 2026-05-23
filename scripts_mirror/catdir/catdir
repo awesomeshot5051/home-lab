@@ -1,0 +1,397 @@
+#!/bin/bash
+set -euo pipefail
+
+# Default values
+TARGET_DIR="."
+MAX_DEPTH=""
+OUTPUT_FILE=""
+EXTENSION=""
+MATCH_MODE="strict"   # strict (default) or glob (-m)
+SORT_ORDER=""         # empty = directory order; "alpha" or "mtime" via -or
+MAX_SIZE=""           # optional max file size in bytes (-s)
+IGNORE_PATTERNS=()    # patterns to ignore (-i)
+
+# Feature toggles
+MARKDOWN_MODE=0
+HASH_MODE=0
+OUTPUT_FORMAT="text"
+USE_FD=0
+USE_RG=0
+TREE_MODE=0
+THREADS=1
+
+# Helper to print usage
+usage() {
+    echo "Usage: $0 [directory] [-e extension] [-d directory] [-md maxdepth] [-o output_file]"
+    echo "         [-m] [-or alpha|mtime] [-s max_bytes] [-i pattern]"
+    echo "         [-md|--markdown] [-h|--hash] [-O json] [-fd|--fd] [-rg|--rg]"
+    echo "         [-t|--tree] [-tx|--threads #]"
+    echo ""
+    echo "Options:"
+    echo "  [directory]          Target directory (default: current directory)"
+    echo "  -e,  --ext           File extension filter (e.g. 'py', '*.txt'). Omit to cat all files."
+    echo "  -d,  -directory      Set target directory (default: current directory)"
+    echo "  -md, -maxdepth       Set max recursion depth (default: fully recursive)"
+    echo "  -o,  -output         Write output to a specific file instead of stdout"
+    echo "  -m,  -match          Use glob matching for extension (default: strict suffix match)"
+    echo "  -or, -ordered        Sort output: 'alpha' (alphabetical) or 'mtime' (modification time)"
+    echo "  -s,  -size           Skip files larger than this many bytes (e.g. 102400 for 100 KB)"
+    echo "  -i,  -ignore         Ignore files matching this pattern (can be used multiple times)"
+    echo "  --markdown           Wrap file contents in markdown code blocks based on extension"
+    echo "  -H,  --hash          Prepend the SHA256 hash of each file"
+    echo "  -O                   Output format ('text' or 'json')"
+    echo "  --fd                 Use 'fd' instead of 'find' for faster searching"
+    echo "  --rg                 Use 'rg' (ripgrep) instead of 'find' for faster searching"
+    echo "  -t,  --tree          Tree summary mode (calculates total size and counts files)"
+    echo "  -tx, --threads       Number of threads for parallel stat calls (ONLY usable with -t/--tree)"
+    exit 1
+}
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -d|-directory) TARGET_DIR="$2"; shift ;;
+        -md|-maxdepth) MAX_DEPTH="$2"; shift ;;
+        -o|-output)    OUTPUT_FILE="$2"; shift ;;
+        -e|--ext|-ext) EXTENSION="$2"; shift ;;
+        -m|-match)     MATCH_MODE="glob" ;;
+        -or|-ordered)
+            SORT_ORDER="$2"
+            if [[ "$SORT_ORDER" != "alpha" && "$SORT_ORDER" != "mtime" ]]; then
+                echo "Error: -or requires 'alpha' or 'mtime'." >&2
+                usage
+            fi
+            shift
+            ;;
+        -s|-size)
+            MAX_SIZE="$2"
+            if ! [[ "$MAX_SIZE" =~ ^[0-9]+$ ]]; then
+                echo "Error: -s requires a positive integer (bytes)." >&2
+                usage
+            fi
+            shift
+            ;;
+        -i|-ignore) IGNORE_PATTERNS+=("$2"); shift ;;
+        -md|--markdown|-markdown) MARKDOWN_MODE=1 ;;
+        -H|--hash|-hash) HASH_MODE=1 ;;
+        -O)
+            OUTPUT_FORMAT="$2"
+            if [[ "$OUTPUT_FORMAT" == "json" ]] && ! command -v jq &>/dev/null; then
+                echo "Error: JSON output requires 'jq' to be installed." >&2
+                exit 1
+            fi
+            shift
+            ;;
+        -fd|--fd) USE_FD=1 ;;
+        -rg|--rg) USE_RG=1 ;;
+        -t|--tree|-tree) TREE_MODE=1 ;;
+        -tx|--threads)
+            THREADS="$2"
+            if ! [[ "$THREADS" =~ ^[0-9]+$ ]]; then
+                echo "Error: -tx requires a positive integer." >&2
+                usage
+            fi
+            shift
+            ;;
+        -h|-help|--help) usage ;;
+        *)
+            if [[ "$1" == -* ]]; then
+                echo "Unknown option: $1" >&2
+                usage
+            fi
+            TARGET_DIR="$1"
+            ;;
+    esac
+    shift
+done
+
+# Validate directory exists
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Error: '$TARGET_DIR' is not a valid directory." >&2
+    exit 1
+fi
+
+# Validate threading constraints
+if [[ "$THREADS" -gt 1 && "$TREE_MODE" -eq 0 ]]; then
+    echo "Error: Parallel processing (-tx/--threads) can ONLY be used with tree summary mode (-t/--tree)." >&2
+    exit 1
+fi
+
+# ==========================================
+# SUB-MODULE: TREE SUMMARY
+# ==========================================
+if [[ "$TREE_MODE" -eq 1 ]]; then
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        exec > "$OUTPUT_FILE"
+    fi
+
+    echo "=== Tree Summary ==="
+    file_count=$(find "$TARGET_DIR" -type f 2>/dev/null | wc -l || echo 0)
+
+    # Portable stat command selection
+    if stat -c%s "$TARGET_DIR" &>/dev/null; then
+        STAT_CMD="stat -c%s"
+    else
+        STAT_CMD="stat -f%z"
+    fi
+
+    if [[ "$THREADS" -gt 1 ]]; then
+        total_bytes=$(find "$TARGET_DIR" -type f -print0 2>/dev/null | xargs -0 -P "$THREADS" -n 500 $STAT_CMD 2>/dev/null | awk '{s+=$1} END {print s}')
+    else
+        total_bytes=$(find "$TARGET_DIR" -type f -exec $STAT_CMD {} + 2>/dev/null | awk '{s+=$1} END {print s}')
+    fi
+    [[ -z "$total_bytes" ]] && total_bytes=0
+
+    echo "File count: $file_count"
+    echo "Total bytes: $total_bytes"
+    echo "Skipped count: 0"
+    echo "-------------------"
+
+    if command -v tree &>/dev/null; then
+        tree "$TARGET_DIR" -a -I '.git' || true
+    else
+        echo "Tree command not found. Falling back to find:"
+        find "$TARGET_DIR" -type f | sort || true
+    fi
+    exit 0
+fi
+
+# ==========================================
+# SUB-MODULE: FILE SELECTION ENGINE
+# ==========================================
+
+get_bare_extension() {
+    local ext="$1"
+    ext="${ext#\*}"
+    ext="${ext#.}"
+    echo "$ext"
+}
+
+generate_file_stream() {
+    local bare
+    bare=$(get_bare_extension "$EXTENSION")
+
+    # Engine: Ripgrep
+    if [[ "$USE_RG" -eq 1 ]] && command -v rg &>/dev/null; then
+        local rg_cmd=("rg" "--files" "--hidden" "-0")
+        if [ -n "$MAX_DEPTH" ]; then rg_cmd+=("--max-depth" "$MAX_DEPTH"); fi
+        if [ -n "$EXTENSION" ]; then
+            if [[ "$MATCH_MODE" == "strict" ]]; then
+                rg_cmd+=("-g" "*.$bare")
+            else
+                rg_cmd+=("-g" "$EXTENSION")
+            fi
+        fi
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            rg_cmd+=("-g" "!$pattern")
+        done
+        rg_cmd+=("-g" "!.git")
+        rg_cmd+=("$TARGET_DIR")
+
+        "${rg_cmd[@]}" || true
+
+    # Engine: fd
+    elif [[ "$USE_FD" -eq 1 ]] && command -v fd &>/dev/null; then
+        local fd_cmd=("fd" "--type" "f" "--hidden" "-0" "--exclude" ".git")
+        if [ -n "$MAX_DEPTH" ]; then fd_cmd+=("--max-depth" "$MAX_DEPTH"); fi
+        if [ -n "$EXTENSION" ]; then
+            if [[ "$MATCH_MODE" == "strict" ]]; then
+                fd_cmd+=("-e" "$bare")
+            else
+                fd_cmd+=("-g" "$EXTENSION")
+            fi
+        fi
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            fd_cmd+=("-E" "$pattern")
+        done
+        fd_cmd+=("$TARGET_DIR")
+
+        "${fd_cmd[@]}" || true
+
+    # Engine: Standard find
+    else
+        local find_cmd=("find" "$TARGET_DIR")
+        if [ -n "$MAX_DEPTH" ]; then find_cmd+=("-maxdepth" "$MAX_DEPTH"); fi
+
+        if [ -n "$EXTENSION" ]; then
+            if [[ "$MATCH_MODE" == "strict" ]]; then
+                find_cmd+=("-name" "*.$bare")
+            else
+                find_cmd+=("-name" "$EXTENSION")
+            fi
+        fi
+
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            find_cmd+=("-not" "-name" "$pattern")
+        done
+        find_cmd+=("-type" "f")
+
+        if [[ "$SORT_ORDER" == "mtime" ]]; then
+            if find "$TARGET_DIR" -maxdepth 0 -printf "" &>/dev/null; then
+                # Requires buffering to sort
+                "${find_cmd[@]}" -printf "%T@ %p\0" 2>/dev/null | sort -z -n | while IFS= read -r -d '' entry; do
+                    printf "%s\0" "${entry#* }"
+                done
+            else
+                echo "Error: '-or mtime' requires GNU find. Use --rg or --fd instead." >&2
+                exit 1
+            fi
+        elif [[ "$SORT_ORDER" == "alpha" ]]; then
+            "${find_cmd[@]}" -print0 2>/dev/null | sort -z
+        else
+            "${find_cmd[@]}" -print0 2>/dev/null
+        fi
+    fi
+}
+
+# ==========================================
+# SUB-MODULE: FILE RENDERER
+# ==========================================
+
+print_header() {
+    local filename="$1"
+    local term_width
+
+    if [[ -t 1 ]]; then
+        term_width=$(tput cols 2>/dev/null || echo 80)
+    else
+        term_width=80
+    fi
+
+    local label=" $filename "
+    local label_len=${#label}
+    local padding_len=$(( (term_width - label_len) / 2 ))
+    [[ "$padding_len" -lt 0 ]] && padding_len=0
+
+    local pad
+    pad=$(printf '%*s' "$padding_len" '' | tr ' ' '=')
+
+    local current_total=$(( padding_len * 2 + label_len ))
+    local right_pad="$pad"
+    [[ "$current_total" -lt "$term_width" ]] && right_pad="${pad}="
+
+    echo "${pad}${label}${right_pad}"
+}
+
+is_binary() {
+    local f="$1"
+    # Fast text heuristic
+    case "$f" in
+        *.txt|*.md|*.markdown|*.rst|*.csv|*.json|*.yaml|*.yml|\
+        *.toml|*.ini|*.cfg|*.conf|*.sh|*.bash|*.zsh|*.fish|\
+        *.py|*.rb|*.pl|*.php|*.lua|*.js|*.ts|*.jsx|*.tsx|\
+        *.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.cs|*.java|*.go|*.rs|\
+        *.html|*.htm|*.css|*.scss|*.sass|*.less|*.xml|*.svg|\
+        *.sql|*.r|*.R|*.m|*.swift|*.kt|*.scala|*.ex|*.exs|\
+        *.tf|*.hcl|*[Dd]ockerfile*|*[Mm]akefile*|*.mk|\
+        *.cshtml|*.vbhtml|*.razor|*.aspx|*.ascx|*.jsp|\
+        *.ejs|*.hbs|*.handlebars|*.pug|*.slim|*.haml|*.erb|\
+        *.liquid|*.twig|*.env|*.gitignore|*.dockerignore|\
+        *.ps1|*.psm1|*.psd1|*.bat|*.cmd|*.awk|*.sed|\
+        *.vim|*.lisp|*.clj|*.cljs|*.elm|*.erl|*.hrl|\
+        *.hs|*.ml|*.mli|*.nim|*.pas|*.pp|*.pro|*.proto|\
+        *.rkt|*.scm|*.tcl|*.zig|*.tex|*.sty|*.cls|*.bib|\
+        *.nix|*.dhall)
+            return 1 ;;
+    esac
+
+    if command -v file &>/dev/null; then
+        file --mime-encoding "$f" 2>/dev/null | grep -q "binary" || return 1
+    else
+        LC_ALL=C grep -q $'\x00' <(head -c 8192 "$f" 2>/dev/null || true) 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+process_file() {
+    local file="$1"
+
+    if [[ -n "$MAX_SIZE" ]]; then
+        local fsize
+        fsize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "")
+        if [[ -z "$fsize" ]]; then
+            echo "  [warning: could not determine size for $file, skipping]" >&2
+            return
+        fi
+        if (( fsize > MAX_SIZE )); then
+            echo "  [skipped: $file (${fsize} bytes > limit ${MAX_SIZE})]" >&2
+            return
+        fi
+    fi
+
+    if is_binary "$file"; then
+        echo "  [skipped: $file (binary)]" >&2
+        return
+    fi
+
+    # JSON Mode Rendering
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        local safe_file safe_content hash_val=""
+        safe_file=$(jq -Rn --arg f "$file" '$f')
+        safe_content=$(jq -Rs . < "$file" || echo '""')
+
+        if [[ "$HASH_MODE" -eq 1 ]]; then
+            hash_val=$(sha256sum "$file" 2>/dev/null | awk 'NF{print $1}' || echo "hash_error")
+            printf '{"file":%s,"hash":"%s","content":%s}\n' "$safe_file" "$hash_val" "$safe_content"
+        else
+            printf '{"file":%s,"content":%s}\n' "$safe_file" "$safe_content"
+        fi
+        return
+    fi
+
+    # Text / Markdown Rendering
+    print_header "$file"
+
+    if [[ "$HASH_MODE" -eq 1 ]]; then
+        local hash_val
+        hash_val=$(sha256sum "$file" 2>/dev/null | awk 'NF{print $1}' || echo "hash_error")
+        echo "SHA256 Hash: $hash_val"
+        echo "----------------------------------------"
+    fi
+
+    if [[ "$MARKDOWN_MODE" -eq 1 ]]; then
+        local ext="${file##*.}"
+        [[ "$file" != *.* ]] && ext="txt"
+        echo '```'"$ext"
+        cat "$file" || true
+        echo ""
+        echo '
+```'
+    else
+        cat "$file" || true
+    fi
+    echo
+}
+
+render_stream() {
+    local found=0
+    # Reading null-terminated strings safely under set -e
+    while IFS= read -r -d '' file || [[ -n "$file" ]]; do
+        found=1
+        process_file "$file"
+    done
+
+    if [[ "$found" -eq 0 ]]; then
+        echo "catdir: no matching files found in '$TARGET_DIR'." >&2
+    fi
+}
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    if [ -n "$OUTPUT_FILE" ]; then
+        generate_file_stream | render_stream | jq -s . > "$OUTPUT_FILE"
+        echo "Done. All files concatenated into JSON: $OUTPUT_FILE" >&2
+    else
+        generate_file_stream | render_stream | jq -s .
+    fi
+else
+    if [ -n "$OUTPUT_FILE" ]; then
+        generate_file_stream | render_stream > "$OUTPUT_FILE"
+        echo "Done. All files concatenated into: $OUTPUT_FILE" >&2
+    else
+        generate_file_stream | render_stream
+    fi
+fi
