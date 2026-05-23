@@ -1,0 +1,20 @@
+[Unit]
+Description=Minecraft Server (Fabric)
+After=network.target
+
+[Service]
+Type=forking
+User=awesomeshot5051
+WorkingDirectory=/home/awesomeshot5051/Minecraft
+
+# Start the server inside a detached screen session named "minecraft"
+ExecStart=/usr/bin/screen -dmS minecraft java -Xmx16G -jar fabric-server-mc.26.1.2-loader.0.19.2-launcher.1.1.1.jar nogui
+
+# Send the "stop" command cleanly to the screen session, then wait for it to save and close
+ExecStop=/usr/bin/screen -S minecraft -X stuff "stop\n"
+TimeoutStopSec=30
+
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
