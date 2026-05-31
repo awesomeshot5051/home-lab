@@ -1,0 +1,14 @@
+[Unit]
+Description=Klipper Print Failure Detection (Custom TFLite)
+After=network.target
+
+[Service]
+Type=simple
+User=awesomeshot5051
+ExecStart=/home/awesomeshot5051/klipper-print-failure-detection/venv/bin/python /home/awesomeshot5051/klipper-print-failure-detection/plugin.py
+WorkingDirectory=/home/awesomeshot5051/klipper-print-failure-detection
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
