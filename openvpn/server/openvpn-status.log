@@ -1,9 +1,9 @@
 TITLE,OpenVPN 2.7.0 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]
-TIME,2026-06-07 23:49:23,1780890563
+TIME,2026-06-08 12:03:51,1780934631
 HEADER,CLIENT_LIST,Common Name,Real Address,Virtual Address,Virtual IPv6 Address,Bytes Received,Bytes Sent,Connected Since,Connected Since (time_t),Username,Client ID,Peer ID,Data Channel Cipher
-CLIENT_LIST,oracle-api-client,udp4:170.9.224.83:59344,10.8.0.2,,833144,830415,2026-06-07 08:05:11,1780833911,UNDEF,73,0,AES-256-GCM
+CLIENT_LIST,oracle-api-client,udp4:170.9.224.83:53527,10.8.0.2,,136104,135605,2026-06-08 09:31:22,1780925482,UNDEF,552,0,AES-256-GCM
 HEADER,ROUTING_TABLE,Virtual Address,Common Name,Real Address,Last Ref,Last Ref (time_t)
-ROUTING_TABLE,10.8.0.2,oracle-api-client,udp4:170.9.224.83:59344,2026-06-07 08:05:11,1780833911
+ROUTING_TABLE,10.8.0.2,oracle-api-client,udp4:170.9.224.83:53527,2026-06-08 09:31:22,1780925482
 GLOBAL_STATS,Max bcast/mcast queue length,0
 GLOBAL_STATS,dco_enabled,1
 END
