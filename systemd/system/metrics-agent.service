@@ -4,6 +4,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+User=awesomeshot5051
 EnvironmentFile=/etc/metrics-agent.env
 ExecStart=/usr/local/bin/collect-metrics.sh
 
