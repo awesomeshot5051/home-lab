@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+
+# Exit immediately if a command exits with a non-zero status, and make sure
+# failures inside a pipeline (used for -v ffmpeg output) aren't swallowed.
+set -e
+set -o pipefail
+
+# A per-user log file: no root required to write it, and it's easy to find
+# because it sits right in the home directory instead of a system path.
+LOG_FILE="${HOME:-/tmp}/tovinci.log"
+RUN_MARKER="=== RUN START"
+VERBOSE=false
+
+usage() {
+    echo "Usage: $(basename "$0") [-v] <file_or_pattern> [file_or_pattern ...]"
+    echo "  e.g. $(basename "$0") clip.mov"
+    echo "       $(basename "$0") -v *.png"
+    exit 1
+}
+
+# --- Argument parsing ---
+while getopts ":v" opt; do
+    case "$opt" in
+        v) VERBOSE=true ;;
+        \?) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -eq 0 ]; then
+    usage
+fi
+
+# --- Resolve arguments into a concrete list of files ---
+# Most of the time the shell already expands something like *.jpg into a
+# list of real filenames before this script even sees them. But if a
+# pattern was quoted, or matched nothing when the shell tried to expand it,
+# we get the literal pattern text instead - so we try expanding it
+# ourselves too. nullglob makes an unmatched pattern expand to nothing
+# (instead of staying as a literal string) while we do that.
+declare -a FILES=()
+shopt -s nullglob
+for arg in "$@"; do
+    if [ -f "$arg" ]; then
+        FILES+=("$arg")
+    elif [[ "$arg" == *[\*\?\[]* ]]; then
+        declare -a MATCHES=($arg)
+        if [ "${#MATCHES[@]}" -gt 0 ]; then
+            FILES+=("${MATCHES[@]}")
+        else
+            echo "Warning: pattern '$arg' matched no files - skipping." >&2
+        fi
+    else
+        echo "Warning: file '$arg' not found - skipping." >&2
+    fi
+done
+shopt -u nullglob
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+    echo "Error: no valid input files found." >&2
+    exit 1
+fi
+
+TOTAL=${#FILES[@]}
+
+# --- Make sure the log location is actually writable; fall back to /tmp if not ---
+if ! touch "$LOG_FILE" 2>/dev/null; then
+    OLD_LOG_FILE="$LOG_FILE"
+    LOG_FILE="/tmp/tovinci.log"
+    echo "Warning: could not write to '$OLD_LOG_FILE', logging to '$LOG_FILE' instead." >&2
+    touch "$LOG_FILE" 2>/dev/null || true
+fi
+
+# --- Always surface unexpected failures on the console, even when quiet ---
+# This catches anything not already handled explicitly below (e.g. ffprobe
+# choking on a malformed file), regardless of whether -v was passed.
+# CURRENT_FILE is set by process_one_file before any risky command runs, so
+# this always points at whichever file was being processed when it fired.
+on_unexpected_error() {
+    local exit_code=$?
+    echo "Error: '$(basename "$0")' failed unexpectedly (exit code $exit_code) while processing '$CURRENT_FILE'." >&2
+    echo "Details, if any were captured, are in the log: $LOG_FILE" >&2
+    exit "$exit_code"
+}
+trap on_unexpected_error ERR
+
+# --- Log rotation: keep entries for 3 runs, wipe the file on the 4th ---
+# One invocation of the script (whether it's converting 1 file or 50) counts
+# as a single "run" for rotation purposes.
+if [ -f "$LOG_FILE" ]; then
+    EXISTING_RUNS=$(grep -c "^${RUN_MARKER}" "$LOG_FILE" 2>/dev/null) || EXISTING_RUNS=0
+    if [ "$EXISTING_RUNS" -ge 3 ]; then
+        rm -f "$LOG_FILE"
+    fi
+fi
+
+# --- Logging helpers ---
+# log: always written to the log file, only echoed to the console with -v
+log() {
+    echo "$1" >> "$LOG_FILE"
+    if [ "$VERBOSE" = true ]; then
+        echo "$1"
+    fi
+}
+
+# notify: important enough to always show on the console too (and logged)
+notify() {
+    echo "$1" >> "$LOG_FILE"
+    echo "$1"
+}
+
+if [ "$TOTAL" -eq 1 ]; then
+    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: '${FILES[0]}' ==="
+else
+    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: $TOTAL files ==="
+fi
+
+# --- Per-file conversion logic, run once for each resolved input file ---
+# Called inside a subshell from the main loop below, so a failure here
+# (whether it's an explicit "return" or set -e/the ERR trap firing) only
+# ends that subshell - it doesn't abort the rest of the batch.
+process_one_file() {
+    local INPUT_FILE="$1"
+    CURRENT_FILE="$INPUT_FILE"
+
+    log "Analyzing '$INPUT_FILE'..."
+
+    # Extract the filename without its extension to build the output name
+    local FILENAME EXTENSION BASENAME EXT_LOWER IS_IMAGE OUTPUT_FILE
+    local -a FFMPEG_ARGS
+    FILENAME=$(basename -- "$INPUT_FILE")
+    EXTENSION="${FILENAME##*.}"
+    BASENAME="${FILENAME%.*}"
+    EXT_LOWER=$(echo "$EXTENSION" | tr '[:upper:]' '[:lower:]')
+
+    # --- Determine if this is an image file ---
+    IS_IMAGE=false
+    case "$EXT_LOWER" in
+        jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2)
+            IS_IMAGE=true
+            ;;
+    esac
+
+    FFMPEG_ARGS=()
+
+    if [ "$IS_IMAGE" = true ]; then
+        log "Image file detected. Automagically configuring for DaVinci Resolve image compatibility..."
+
+        OUTPUT_FILE="${BASENAME}_davinci.jpg"
+
+        # JPEG only supports 8-bit color, so there's no high/low bit-depth
+        # branch to worry about here - ffmpeg will quietly downconvert
+        # anything higher on its own.
+        # -q:v 2 is ffmpeg's quality scale (1-31, lower = better) - 2 is
+        # close to visually lossless. -update 1 tells the image2 muxer to
+        # write a single file instead of expecting a numbered sequence.
+        log "Converting to high-quality JPEG..."
+        FFMPEG_ARGS=(-pix_fmt yuvj420p -q:v 2 -update 1)
+    else
+        local HAS_VIDEO HAS_AUDIO PIX_FMT
+
+        # Check for video streams
+        HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
+
+        # Check for audio streams cleanly
+        HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
+
+        # Determine processing mode: Audio-Only or Video
+        if [ -z "$HAS_VIDEO" ] && [ "$HAS_AUDIO" = "audio" ]; then
+            log "Sole audio file detected. Automagically configuring for DaVinci Resolve Linux audio compatibility..."
+            OUTPUT_FILE="${BASENAME}_davinci.wav"
+            FFMPEG_ARGS=(-c:a pcm_s24le)
+        else
+            OUTPUT_FILE="${BASENAME}_davinci.mov"
+
+            # Extract the raw pixel format string safely
+            PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nk=1:nw=1 "$INPUT_FILE")
+            log "Detected source pixel format: $PIX_FMT"
+
+            # Determine the best DNxHR profile based on the bit depth/pixel format
+            if [[ "$PIX_FMT" == *"10"* || "$PIX_FMT" == *"12"* || "$PIX_FMT" == *"le"* ]]; then
+                log "High bit-depth detected. Transcoding to 10-bit DNxHR HQX..."
+                FFMPEG_ARGS=(-c:v dnxhd -profile:v dnxhr_hqx -pix_fmt yuv422p10le)
+            else
+                log "Standard bit-depth detected. Transcoding to 8-bit DNxHR HQ..."
+                FFMPEG_ARGS=(-c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p)
+            fi
+
+            if [ "$HAS_AUDIO" = "audio" ]; then
+                log "Audio stream detected. Retaining uncompressed audio."
+                FFMPEG_ARGS+=(-c:a pcm_s16le)
+            else
+                log "No audio stream detected. Stripping audio track."
+                FFMPEG_ARGS+=(-an)
+            fi
+        fi
+    fi
+
+    log "Running FFmpeg command..."
+    log "ffmpeg -i \"$INPUT_FILE\" ${FFMPEG_ARGS[*]} \"$OUTPUT_FILE\""
+    log "--------------------------------------------------------"
+
+    # Execute the transcode/convert.
+    # -y avoids ffmpeg hanging on an overwrite prompt now that its output
+    # is normally redirected straight to the log instead of the terminal.
+    local FFMPEG_STATUS=0
+    if [ "$VERBOSE" = true ]; then
+        ffmpeg -y -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" || FFMPEG_STATUS=$?
+    else
+        ffmpeg -y -loglevel error -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" >> "$LOG_FILE" 2>&1 || FFMPEG_STATUS=$?
+    fi
+
+    if [ "$FFMPEG_STATUS" -ne 0 ]; then
+        trap - ERR
+        echo "Error: ffmpeg failed (exit code $FFMPEG_STATUS) while processing '$INPUT_FILE'." >&2
+        if [ "$VERBOSE" != true ]; then
+            echo "Last few lines of ffmpeg output:" >&2
+            tail -n 10 "$LOG_FILE" >&2
+        fi
+        echo "Full details: $LOG_FILE" >&2
+        return "$FFMPEG_STATUS"
+    fi
+
+    log "--------------------------------------------------------"
+    notify "Done! Highly compatible file created: '$OUTPUT_FILE'"
+    return 0
+}
+
+# --- Main loop: process every resolved file, continuing past failures ---
+declare -a FAILED_FILES=()
+SUCCESS_COUNT=0
+
+for f in "${FILES[@]}"; do
+    if ( process_one_file "$f" ); then
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        FAILED_FILES+=("$f")
+    fi
+done
+
+# Only print a batch summary when there was actually a batch - a single
+# file already gets its own clear success/error message above.
+if [ "$TOTAL" -gt 1 ]; then
+    log "--------------------------------------------------------"
+    if [ "${#FAILED_FILES[@]}" -eq 0 ]; then
+        notify "Done! All $TOTAL file(s) converted successfully."
+    else
+        notify "Finished: $SUCCESS_COUNT/$TOTAL file(s) converted successfully."
+        notify "Failed to convert:"
+        for f in "${FAILED_FILES[@]}"; do
+            notify "  - $f"
+        done
+        echo "See $LOG_FILE for details." >&2
+    fi
+fi
+
+if [ "${#FAILED_FILES[@]}" -ne 0 ]; then
+    exit 1
+fi
+exit 0
