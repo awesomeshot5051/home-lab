@@ -1,43 +1,159 @@
 #!/usr/bin/env bash
-
-# Exit immediately if a command exits with a non-zero status, and make sure
-# failures inside a pipeline (used for -v ffmpeg output) aren't swallowed.
 set -e
 set -o pipefail
 
-# A per-user log file: no root required to write it, and it's easy to find
-# because it sits right in the home directory instead of a system path.
 LOG_FILE="${HOME:-/tmp}/tovinci.log"
 RUN_MARKER="=== RUN START"
-VERBOSE=false
+VERBOSE_LEVEL=0     # 0=quiet, 1=-v (steps + brief ffmpeg summary), 2=-vv (full live ffmpeg output)
+TARGET_TYPE=""      # optional override via -t
+THREADED=false      # forced via --threaded
+JOBS=1              # concurrent files, via -j/--jobs
+AUTO_THREAD_BYTES=$((10 * 1024 * 1024 * 1024))  # 10GB auto-threading threshold
+GPU_REQUESTED=false # via -use-gpu=true
+GPU_HWACCEL=""      # detected backend: cuda / vaapi / qsv, empty = none available
+GPU_HWACCEL_DEVICE="" # e.g. /dev/dri/renderD128 for vaapi
 
 usage() {
-    echo "Usage: $(basename "$0") [-v] <file_or_pattern> [file_or_pattern ...]"
+    echo "Usage: $(basename "$0") [-v|-vv] [-t wav] [--threaded] [-j N|--jobs N] [-use-gpu=true|false] <file_or_pattern> [file_or_pattern ...]"
     echo "  e.g. $(basename "$0") clip.mov"
-    echo "       $(basename "$0") -v *.png"
+    echo "       $(basename "$0") -v *.png                # step log + brief ffmpeg summary"
+    echo "       $(basename "$0") -vv *.png               # full raw ffmpeg output, streamed live"
+    echo "       $(basename "$0") -t wav song.mp3         # force audio-only, ignore embedded art/video"
+    echo "       $(basename "$0") --threaded huge_clip.mov  # force multi-threaded encoding regardless of size"
+    echo "       $(basename "$0") -j 4 *.mov              # process up to 4 files concurrently"
+    echo "       $(basename "$0") -use-gpu=true clip.mov  # decode on GPU (NVDEC/VAAPI/QSV) if available; encode stays on CPU"
     exit 1
 }
 
+# --- Pre-scan for long options (getopts can't parse --threaded / --jobs) ---
+declare -a ARGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --threaded)
+            THREADED=true
+            shift
+            ;;
+        --jobs)
+            JOBS="${2:-}"
+            shift 2
+            ;;
+        --jobs=*)
+            JOBS="${1#--jobs=}"
+            shift
+            ;;
+        -use-gpu=*)
+            case "${1#-use-gpu=}" in
+                [Tt][Rr][Uu][Ee]) GPU_REQUESTED=true ;;
+                [Ff][Aa][Ll][Ss][Ee]) GPU_REQUESTED=false ;;
+                *)
+                    echo "Error: -use-gpu must be true or false (got '${1#-use-gpu=}')." >&2
+                    usage
+                    ;;
+            esac
+            shift
+            ;;
+        --)
+            ARGS+=("$1")
+            shift
+            while [ "$#" -gt 0 ]; do
+                ARGS+=("$1")
+                shift
+            done
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${ARGS[@]}"
+
 # --- Argument parsing ---
-while getopts ":v" opt; do
+while getopts ":vt:j:" opt; do
     case "$opt" in
-        v) VERBOSE=true ;;
+        v) VERBOSE_LEVEL=$((VERBOSE_LEVEL + 1)) ;;
+        t) TARGET_TYPE="$OPTARG" ;;
+        j) JOBS="$OPTARG" ;;
         \?) usage ;;
+        :) usage ;;
     esac
 done
 shift $((OPTIND - 1))
+
+if [ -n "$TARGET_TYPE" ]; then
+    case "$TARGET_TYPE" in
+        wav) ;; # supported
+        *)
+            echo "Error: unsupported -t type '$TARGET_TYPE' (supported: wav)." >&2
+            usage
+            ;;
+    esac
+fi
+
+if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: -j/--jobs must be a positive integer (got '$JOBS')." >&2
+    usage
+fi
 
 if [ "$#" -eq 0 ]; then
     usage
 fi
 
+# --- Determine thread count once for the whole run ---
+THREAD_COUNT=1
+if command -v nproc >/dev/null 2>&1; then
+    THREAD_COUNT=$(nproc)
+elif command -v sysctl >/dev/null 2>&1; then
+    THREAD_COUNT=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+fi
+
+# --- Detect a usable GPU decode backend, if -use-gpu=true was requested.
+#     Note: ffmpeg has no GPU encoder for DNxHR (it's an Avid codec, CPU-only
+#     in ffmpeg), so this only accelerates decoding the *source* file. The
+#     DNxHR encode - and -threads multithreading - still happen on the CPU
+#     regardless. Preference order below favors whichever backend is both
+#     compiled into this ffmpeg and has evidence of real hardware present. ---
+detect_gpu_hwaccel() {
+    local available candidate
+    available=$(ffmpeg -hide_banner -hwaccels 2>/dev/null | tail -n +2)
+
+    for candidate in cuda vaapi qsv; do
+        if echo "$available" | grep -qx "$candidate"; then
+            case "$candidate" in
+                cuda)
+                    if command -v nvidia-smi >/dev/null 2>&1; then
+                        GPU_HWACCEL="cuda"
+                        return 0
+                    fi
+                    ;;
+                vaapi)
+                    if [ -e /dev/dri/renderD128 ]; then
+                        GPU_HWACCEL="vaapi"
+                        GPU_HWACCEL_DEVICE="/dev/dri/renderD128"
+                        return 0
+                    fi
+                    ;;
+                qsv)
+                    if [ -e /dev/dri/renderD128 ]; then
+                        GPU_HWACCEL="qsv"
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+if [ "$GPU_REQUESTED" = true ]; then
+    if detect_gpu_hwaccel; then
+        echo "GPU-accelerated decode enabled (backend: $GPU_HWACCEL). DNxHR encoding itself still runs on the CPU - ffmpeg has no GPU encoder for that codec." >&2
+    else
+        echo "Warning: -use-gpu=true requested, but no usable GPU decode backend was detected (checked cuda/vaapi/qsv). Falling back to CPU decoding." >&2
+    fi
+fi
+
 # --- Resolve arguments into a concrete list of files ---
-# Most of the time the shell already expands something like *.jpg into a
-# list of real filenames before this script even sees them. But if a
-# pattern was quoted, or matched nothing when the shell tried to expand it,
-# we get the literal pattern text instead - so we try expanding it
-# ourselves too. nullglob makes an unmatched pattern expand to nothing
-# (instead of staying as a literal string) while we do that.
 declare -a FILES=()
 shopt -s nullglob
 for arg in "$@"; do
@@ -63,7 +179,6 @@ fi
 
 TOTAL=${#FILES[@]}
 
-# --- Make sure the log location is actually writable; fall back to /tmp if not ---
 if ! touch "$LOG_FILE" 2>/dev/null; then
     OLD_LOG_FILE="$LOG_FILE"
     LOG_FILE="/tmp/tovinci.log"
@@ -71,11 +186,6 @@ if ! touch "$LOG_FILE" 2>/dev/null; then
     touch "$LOG_FILE" 2>/dev/null || true
 fi
 
-# --- Always surface unexpected failures on the console, even when quiet ---
-# This catches anything not already handled explicitly below (e.g. ffprobe
-# choking on a malformed file), regardless of whether -v was passed.
-# CURRENT_FILE is set by process_one_file before any risky command runs, so
-# this always points at whichever file was being processed when it fired.
 on_unexpected_error() {
     local exit_code=$?
     echo "Error: '$(basename "$0")' failed unexpectedly (exit code $exit_code) while processing '$CURRENT_FILE'." >&2
@@ -84,9 +194,6 @@ on_unexpected_error() {
 }
 trap on_unexpected_error ERR
 
-# --- Log rotation: keep entries for 3 runs, wipe the file on the 4th ---
-# One invocation of the script (whether it's converting 1 file or 50) counts
-# as a single "run" for rotation purposes.
 if [ -f "$LOG_FILE" ]; then
     EXISTING_RUNS=$(grep -c "^${RUN_MARKER}" "$LOG_FILE" 2>/dev/null) || EXISTING_RUNS=0
     if [ "$EXISTING_RUNS" -ge 3 ]; then
@@ -94,46 +201,51 @@ if [ -f "$LOG_FILE" ]; then
     fi
 fi
 
-# --- Logging helpers ---
-# log: always written to the log file, only echoed to the console with -v
-log() {
-    echo "$1" >> "$LOG_FILE"
-    if [ "$VERBOSE" = true ]; then
-        echo "$1"
+# --- Logging helpers. When running multiple jobs concurrently, prefix with
+#     the current file so interleaved terminal/log output stays readable. ---
+line_prefix() {
+    if [ "$JOBS" -gt 1 ] && [ -n "${CURRENT_FILE:-}" ]; then
+        echo "[$(basename -- "$CURRENT_FILE")] "
     fi
 }
 
-# notify: important enough to always show on the console too (and logged)
+log() {
+    echo "$(line_prefix)$1" >> "$LOG_FILE"
+    if [ "$VERBOSE_LEVEL" -ge 1 ]; then
+        echo "$(line_prefix)$1"
+    fi
+}
+
 notify() {
-    echo "$1" >> "$LOG_FILE"
-    echo "$1"
+    echo "$(line_prefix)$1" >> "$LOG_FILE"
+    echo "$(line_prefix)$1"
 }
 
 if [ "$TOTAL" -eq 1 ]; then
     log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: '${FILES[0]}' ==="
 else
-    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: $TOTAL files ==="
+    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: $TOTAL files (jobs=$JOBS) ==="
 fi
 
-# --- Per-file conversion logic, run once for each resolved input file ---
-# Called inside a subshell from the main loop below, so a failure here
-# (whether it's an explicit "return" or set -e/the ERR trap firing) only
-# ends that subshell - it doesn't abort the rest of the batch.
+# --- Portable file size helper (GNU stat vs BSD/macOS stat) ---
+get_file_size() {
+    stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
 process_one_file() {
     local INPUT_FILE="$1"
     CURRENT_FILE="$INPUT_FILE"
 
     log "Analyzing '$INPUT_FILE'..."
 
-    # Extract the filename without its extension to build the output name
-    local FILENAME EXTENSION BASENAME EXT_LOWER IS_IMAGE OUTPUT_FILE
-    local -a FFMPEG_ARGS
+    local FILENAME EXTENSION BASENAME EXT_LOWER IS_IMAGE OUTPUT_FILE FILE_SIZE USE_THREADS
+    local -a FFMPEG_ARGS FFMPEG_PRE_ARGS
+    FFMPEG_PRE_ARGS=()
     FILENAME=$(basename -- "$INPUT_FILE")
     EXTENSION="${FILENAME##*.}"
     BASENAME="${FILENAME%.*}"
     EXT_LOWER=$(echo "$EXTENSION" | tr '[:upper:]' '[:lower:]')
 
-    # --- Determine if this is an image file ---
     IS_IMAGE=false
     case "$EXT_LOWER" in
         jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2)
@@ -141,31 +253,48 @@ process_one_file() {
             ;;
     esac
 
+    FILE_SIZE=$(get_file_size "$INPUT_FILE")
+    USE_THREADS=false
+    if [ "$THREADED" = true ] || [ "$FILE_SIZE" -ge "$AUTO_THREAD_BYTES" ]; then
+        USE_THREADS=true
+    fi
+
     FFMPEG_ARGS=()
 
     if [ "$IS_IMAGE" = true ]; then
         log "Image file detected. Automagically configuring for DaVinci Resolve image compatibility..."
-
         OUTPUT_FILE="${BASENAME}_davinci.jpg"
-
-        # JPEG only supports 8-bit color, so there's no high/low bit-depth
-        # branch to worry about here - ffmpeg will quietly downconvert
-        # anything higher on its own.
-        # -q:v 2 is ffmpeg's quality scale (1-31, lower = better) - 2 is
-        # close to visually lossless. -update 1 tells the image2 muxer to
-        # write a single file instead of expecting a numbered sequence.
         log "Converting to high-quality JPEG..."
         FFMPEG_ARGS=(-pix_fmt yuvj420p -q:v 2 -update 1)
+        # Single-frame encode - threading doesn't help here, so it's skipped
+        # even if USE_THREADS is true.
+
+    elif [ "$TARGET_TYPE" = "wav" ]; then
+        # User has explicitly told us to treat this as audio-only, so skip
+        # video-stream detection entirely - it doesn't matter whether ffprobe
+        # sees a "video" stream (e.g. embedded cover art in an mp3).
+        local HAS_AUDIO
+        HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
+
+        if [ "$HAS_AUDIO" != "audio" ]; then
+            echo "Error: -t wav specified but no audio stream found in '$INPUT_FILE'." >&2
+            return 1
+        fi
+
+        log "Forced audio-only mode (-t wav). Automagically configuring for DaVinci Resolve Linux audio compatibility..."
+        OUTPUT_FILE="${BASENAME}_davinci.wav"
+        # -vn drops any video/attached-picture stream so it doesn't get
+        # dragged along and rejected by the WAV muxer.
+        FFMPEG_ARGS=(-vn -c:a pcm_s24le)
+        # PCM audio encoding is not thread-parallelizable in ffmpeg, so
+        # -threads is not applied here even if USE_THREADS is true.
+
     else
         local HAS_VIDEO HAS_AUDIO PIX_FMT
 
-        # Check for video streams
         HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
-
-        # Check for audio streams cleanly
         HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
 
-        # Determine processing mode: Audio-Only or Video
         if [ -z "$HAS_VIDEO" ] && [ "$HAS_AUDIO" = "audio" ]; then
             log "Sole audio file detected. Automagically configuring for DaVinci Resolve Linux audio compatibility..."
             OUTPUT_FILE="${BASENAME}_davinci.wav"
@@ -173,17 +302,39 @@ process_one_file() {
         else
             OUTPUT_FILE="${BASENAME}_davinci.mov"
 
-            # Extract the raw pixel format string safely
             PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nk=1:nw=1 "$INPUT_FILE")
             log "Detected source pixel format: $PIX_FMT"
 
-            # Determine the best DNxHR profile based on the bit depth/pixel format
             if [[ "$PIX_FMT" == *"10"* || "$PIX_FMT" == *"12"* || "$PIX_FMT" == *"le"* ]]; then
                 log "High bit-depth detected. Transcoding to 10-bit DNxHR HQX..."
                 FFMPEG_ARGS=(-c:v dnxhd -profile:v dnxhr_hqx -pix_fmt yuv422p10le)
             else
                 log "Standard bit-depth detected. Transcoding to 8-bit DNxHR HQ..."
                 FFMPEG_ARGS=(-c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p)
+            fi
+
+            if [ "$USE_THREADS" = true ]; then
+                if [ "$THREADED" = true ]; then
+                    log "Threaded mode forced (--threaded). Using $THREAD_COUNT encoder threads."
+                else
+                    log "File size ($FILE_SIZE bytes) exceeds 10GB threshold. Automagically enabling $THREAD_COUNT encoder threads..."
+                fi
+                FFMPEG_ARGS+=(-threads "$THREAD_COUNT")
+            fi
+
+            if [ -n "$GPU_HWACCEL" ]; then
+                log "Using GPU-accelerated ($GPU_HWACCEL) decode for the source file. Encode + threading above still run on CPU."
+                case "$GPU_HWACCEL" in
+                    cuda)
+                        FFMPEG_PRE_ARGS=(-hwaccel cuda)
+                        ;;
+                    vaapi)
+                        FFMPEG_PRE_ARGS=(-vaapi_device "$GPU_HWACCEL_DEVICE" -hwaccel vaapi)
+                        ;;
+                    qsv)
+                        FFMPEG_PRE_ARGS=(-hwaccel qsv)
+                        ;;
+                esac
             fi
 
             if [ "$HAS_AUDIO" = "audio" ]; then
@@ -197,23 +348,49 @@ process_one_file() {
     fi
 
     log "Running FFmpeg command..."
-    log "ffmpeg -i \"$INPUT_FILE\" ${FFMPEG_ARGS[*]} \"$OUTPUT_FILE\""
+    log "ffmpeg ${FFMPEG_PRE_ARGS[*]} -i \"$INPUT_FILE\" ${FFMPEG_ARGS[*]} \"$OUTPUT_FILE\""
     log "--------------------------------------------------------"
 
-    # Execute the transcode/convert.
-    # -y avoids ffmpeg hanging on an overwrite prompt now that its output
-    # is normally redirected straight to the log instead of the terminal.
+    # Runs ffmpeg with the current FFMPEG_PRE_ARGS/FFMPEG_ARGS (both visible
+    # here via bash's dynamic scoping, since this is only ever called from
+    # within process_one_file), honoring the current -v/-vv verbosity level.
+    run_ffmpeg() {
+        local status=0
+        if [ "$VERBOSE_LEVEL" -ge 2 ]; then
+            # -vv: stream everything ffmpeg prints, live, straight to the terminal and log.
+            ffmpeg -y "${FFMPEG_PRE_ARGS[@]}" -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" || status=$?
+        elif [ "$VERBOSE_LEVEL" -eq 1 ]; then
+            # -v: show ffmpeg's live progress line (frame/fps/q/size/time/bitrate/
+            # speed) updating in real time as it encodes, without the banner,
+            # input/output metadata dump, or stream-mapping noise. -stats is
+            # passed explicitly because ffmpeg otherwise suppresses that live
+            # progress output whenever stdout/stderr isn't a real terminal (e.g.
+            # piped through tee, as it is here).
+            ffmpeg -y -hide_banner -loglevel error -stats "${FFMPEG_PRE_ARGS[@]}" -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" || status=$?
+        else
+            # default: fully quiet, everything goes to the log only.
+            ffmpeg -y -loglevel error "${FFMPEG_PRE_ARGS[@]}" -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" >> "$LOG_FILE" 2>&1 || status=$?
+        fi
+        return "$status"
+    }
+
     local FFMPEG_STATUS=0
-    if [ "$VERBOSE" = true ]; then
-        ffmpeg -y -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" || FFMPEG_STATUS=$?
-    else
-        ffmpeg -y -loglevel error -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" >> "$LOG_FILE" 2>&1 || FFMPEG_STATUS=$?
+    run_ffmpeg || FFMPEG_STATUS=$?
+
+    if [ "$FFMPEG_STATUS" -ne 0 ] && [ "${#FFMPEG_PRE_ARGS[@]}" -gt 0 ]; then
+        # GPU-accelerated decode failed (unsupported source codec, no actual
+        # hardware behind the reported backend, driver issue, etc). Fall back
+        # to CPU decode and retry once before giving up on this file.
+        log "GPU-accelerated decode failed (exit code $FFMPEG_STATUS) for '$INPUT_FILE'. Retrying with CPU decode..."
+        FFMPEG_PRE_ARGS=()
+        FFMPEG_STATUS=0
+        run_ffmpeg || FFMPEG_STATUS=$?
     fi
 
     if [ "$FFMPEG_STATUS" -ne 0 ]; then
         trap - ERR
         echo "Error: ffmpeg failed (exit code $FFMPEG_STATUS) while processing '$INPUT_FILE'." >&2
-        if [ "$VERBOSE" != true ]; then
+        if [ "$VERBOSE_LEVEL" -lt 2 ]; then
             echo "Last few lines of ffmpeg output:" >&2
             tail -n 10 "$LOG_FILE" >&2
         fi
@@ -226,20 +403,38 @@ process_one_file() {
     return 0
 }
 
-# --- Main loop: process every resolved file, continuing past failures ---
 declare -a FAILED_FILES=()
 SUCCESS_COUNT=0
 
+STATUS_DIR=$(mktemp -d)
+cleanup_status_dir() { rm -rf "$STATUS_DIR"; }
+trap cleanup_status_dir EXIT
+
+i=0
 for f in "${FILES[@]}"; do
-    if ( process_one_file "$f" ); then
+    # Throttle to at most $JOBS concurrent files.
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
+        wait -n
+    done
+    (
+        if process_one_file "$f"; then
+            echo 0 > "$STATUS_DIR/$i.status"
+        else
+            echo 1 > "$STATUS_DIR/$i.status"
+        fi
+    ) &
+    i=$((i + 1))
+done
+wait
+
+for ((idx = 0; idx < TOTAL; idx++)); do
+    if [ "$(cat "$STATUS_DIR/$idx.status" 2>/dev/null)" = "0" ]; then
         SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     else
-        FAILED_FILES+=("$f")
+        FAILED_FILES+=("${FILES[$idx]}")
     fi
 done
 
-# Only print a batch summary when there was actually a batch - a single
-# file already gets its own clear success/error message above.
 if [ "$TOTAL" -gt 1 ]; then
     log "--------------------------------------------------------"
     if [ "${#FAILED_FILES[@]}" -eq 0 ]; then
