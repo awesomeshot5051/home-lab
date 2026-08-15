@@ -3,7 +3,7 @@
 ## 📊 System Overview
 * **Hostname:** vpn.server.england
 * **IP Address:** 192.168.0.140
-* **Operating System:** Ubuntu 24.04.3 LTS (Noble Numbat)
+* **Operating System:** Ubuntu **redacted** LTS (**redacted**)
 * **Primary Role:** Secure VPN Gateway & Internal Infrastructure Controller (WoL)
 
 ---
@@ -22,7 +22,7 @@
 ## 🔐 Proprietary: WolAuthServer
 The **WolAuthServer** serves as a secure gatekeeper for waking internal hardware.
 
-* **Network:** Listens on TCP Port **12222**.
+* **Network:** Listens on TCP Port **redacted**.
 * **Logic:** Uses an RSA-2048 challenge-response mechanism to verify client identity.
 * **Security:** Features automated hourly key rotation with a 2-hour grace period for previous keys to prevent session drops.
 * **Target:** Primary trigger for waking the DB Server at `192.168.0.143`.
@@ -51,7 +51,7 @@ Scheduled tasks are managed via `crontab` and custom scripts in `/usr/local/bin/
 ---
 
 ## 📡 Networking & Ports
-* **Port 12222:** WolAuthServer (Internal Registration/Auth).
-* **Port 8080:** SearXNG Web Interface.
+* **Port redacted:** WolAuthServer (Internal Registration/Auth).
+* **Port redacted:** SearXNG Web Interface.
 * **Port 22:** Standard SSH.
 * **Port 53:** Systemd-resolved DNS.

@@ -23,7 +23,7 @@ This server provides redundancy for the core network while introducing a securit
 Acts as the secondary storage node, housing backups for the primary file server data.
 
 * **Samba (SMB/CIFS):** `smbd.service` and `nmbd.service` facilitate local network access to backup volumes.
-* **File Browser:** `filebrowser.service` provides a web-based interface for managing backup archives (Port 8080).
+* **File Browser:** `filebrowser.service` provides a web-based interface for managing backup archives (Port **redacted**).
 * **Hardware Optimization:** Uses `ethtool` via crontab at reboot to disable Energy Efficient Ethernet (EEE) on the `eno1` interface, ensuring consistent network performance and preventing link drops.
 
 ---
@@ -47,7 +47,7 @@ The server follows the global power-saving policy while maintaining specific ove
 
 * **Port 53 (TCP/UDP):** DNS / Pi-hole Filtering.
 * **Port 80 / 443 (TCP):** Pi-hole Admin Console and Web Routing.
-* **Port 8080 (TCP):** File Browser interface.
+* **Port redacted (TCP):** File Browser interface.
 * **Port 139 / 445 (TCP):** Samba / NetBIOS backup shares.
 * **Port 22 (TCP):** SSH Administrative Access.
 * **Port 953 (TCP):** BIND Remote Control Channel (RNDC).

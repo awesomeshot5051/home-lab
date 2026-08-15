@@ -4,7 +4,7 @@
 * **Hostname:** database.server.england
 * **IP Address:** 192.168.0.143
 * **Primary Role:** Backend Data Store for [File Encryption Software](https://englandtechnologies.net) and License Management.
-* **Storage Engine:** ZFS (VaultDB Pool) with MariaDB 10.11.
+* **Storage Engine:** ZFS (VaultDB Pool) with MariaDB **redacted**.
 
 ---
 
@@ -13,7 +13,7 @@ This server manages sensitive cryptographic metadata and licensing keys. Due to 
 
 | Service | Component | Description |
 | :--- | :--- | :--- |
-| **MariaDB** | `mariadb.service` | Primary SQL database server listening on port 46317. |
+| **MariaDB** | `mariadb.service` | Primary SQL database server listening on port **redacted**. |
 | **Fail2Ban** | `fail2ban.service` | Intrusion prevention protecting SSH and database ports. |
 | **ZFS Event Daemon** | `zfs-zed.service` | Monitors pool health and automates snapshot events. |
 | **License Sync** | `license-db-sync.service` | Automates two-way synchronization between local MariaDB and Aiven Cloud DB. |
@@ -26,7 +26,7 @@ A specialized coordination system is used to manage the server's availability an
 
 * **heartbeat-controller.service**: A Java-based application that manages system state and potential shutdowns.
 * **heartbeat.service**: A UDP-based listener providing connectivity signals.
-* **heartbeat-middleman.sh**: A critical orchestration script used to switch between the controller and the heartbeat server. It ensures that port 46317 is properly released and re-bound during transitions to avoid bind failures.
+* **heartbeat-middleman.sh**: A critical orchestration script used to switch between the controller and the heartbeat server. It ensures that port **redacted** is properly released and re-bound during transitions to avoid bind failures.
 * **boot-manager.sh**: Executed during the boot sequence to detect maintenance windows (08:00 and 22:00-23:00). If a window is detected, it preemptively stops the heartbeat-controller to allow for uninterrupted updates and backups.
 
 ---
@@ -62,8 +62,8 @@ The system maintains a bidirectional sync with a remote Aiven Cloud MySQL instan
 
 | Port | Protocol | Service | Note |
 | :--- | :--- | :--- | :--- |
-| **46317** | **TCP** | MariaDB | Primary Database Listener. |
-| **46317*** | **UDP** | Heartbeat | *Subject to Middleman Orchestration. Conflict managed by `heartbeat-middleman.sh`. |
+| **redacted** | **TCP** | MariaDB | Primary Database Listener. |
+| **redacted*** | **UDP** | Heartbeat | *Subject to Middleman Orchestration. Conflict managed by `heartbeat-middleman.sh`. |
 | **22** | **TCP** | SSH | Administrative Access. |
 | **53** | **TCP/UDP** | systemd-resolved | Local Name Resolution. |
 

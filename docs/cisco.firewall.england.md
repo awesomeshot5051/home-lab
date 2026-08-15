@@ -3,7 +3,7 @@
 ## System Overview
 * **Hostname:** cisco.firewall.england
 * **IP Address:** 192.168.0.1 (Internal Gateway)
-* **OS:** FreeBSD 14.3-RELEASE-p7 (OPNsense 25.7 Stable)
+* **OS:** FreeBSD **redacted** (OPNsense **redacted** Stable)
 * **Architecture:** amd64
 * **Primary Role:** Stateful Firewall, NAT Gateway, and Perimeter Security.
 
@@ -36,9 +36,9 @@ The gateway handles several critical redirections to internal lab servers:
 ### Ingress Port Mapping (RDR)
 | External Port | Protocol | Internal Target | Target Port | Service |
 | :--- | :--- | :--- | :--- | :--- |
-| **1194** | TCP/UDP | 192.168.0.140 | 1194 | OpenVPN Tunnel |
-| **12222** | TCP/UDP | 192.168.0.140 | 12222 | WolAuthServer |
-| **46317** | TCP/UDP | 192.168.0.143 | 46317 | DB Server (Encrypted Data) |
+| **redacted** | TCP/UDP | 192.168.0.140 | **redacted** | OpenVPN Tunnel |
+| **redacted** | TCP/UDP | 192.168.0.140 | **redacted** | WolAuthServer |
+| **redacted** | TCP/UDP | 192.168.0.143 | **redacted** | DB Server (Encrypted Data) |
 
 ### Outbound NAT
 * **Standard Masquerade:** All internal traffic from `192.168.0.0/24` is NAT'ed through `em0`.

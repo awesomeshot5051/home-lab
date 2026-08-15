@@ -16,7 +16,7 @@ The server manages a hybrid storage array totaling approximately 6.5 TB of raw c
 * **Protocols:**
     * **Samba (SMB/CIFS):** Managed by `smbd` and `nmbd` for cross-platform file sharing.
     * **iSCSI:** Managed by `tgt.service` on Port 3260 for block-level storage presentation.
-    * **Web/HTTPS:** Caddy acts as a reverse proxy/web server, with File Browser providing a GUI (Ports 80, 8080, 8081).
+    * **Web/HTTPS:** Caddy acts as a reverse proxy/web server, with File Browser providing a GUI (Ports 80, **redacted**, **redacted**).
 
 ---
 
@@ -47,7 +47,7 @@ The backup lifecycle is orchestrated by systemd rather than standard cron, allow
 * **Port 445 / 139 (TCP):** Samba / NetBIOS File Sharing.
 * **Port 3260 (TCP):** iSCSI Target Daemon (`tgt`).
 * **Port 80 (TCP):** HTTP (Caddy).
-* **Port 8080 / 8081 (TCP):** File Browser Web Interface.
+* **Port redacted / redacted (TCP):** File Browser Web Interface.
 * **Port 22 (TCP):** SSH Administrative Access.
 
 ---
