@@ -1,0 +1,12 @@
+[Unit]
+Description=Monthly ZFS backup to the backup server
+After=network-online.target
+Wants=network-online.target
+OnFailure=monthly-backup-failed.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/monthly_backup
+StateDirectory=monthly-backup
+TimeoutStartSec=infinity
+Nice=10

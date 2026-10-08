@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the monthly ZFS backup on the 1st at 10:00
+
+[Timer]
+OnCalendar=*-*-01 10:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

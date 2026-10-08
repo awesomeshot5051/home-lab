@@ -1,0 +1,7 @@
+[Unit]
+Description=Record a failed monthly backup
+
+[Service]
+Type=oneshot
+StateDirectory=monthly-backup
+ExecStart=/bin/sh -c 'date -Is > /var/lib/monthly-backup/FAILED && logger -p user.crit -t monthly-backup "Monthly backup FAILED. Run: journalctl -u monthly-backup.service"'
