@@ -1,0 +1,160 @@
+#!/bin/bash
+# rawproject (server): manage per-project "Raw" datasets with short snapshot retention
+# Usage:
+#   sudo rawproject create "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
+#   sudo rawproject preview "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
+#   sudo rawproject finish [--yes] "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
+#   rawproject list
+set -euo pipefail
+
+POOL="storage"
+PARENT="${POOL}/raw"
+ROOT="/mnt/MergedStorage"
+OWNER="awesomeshot5051"
+
+usage() {
+    echo "Usage: rawproject create|preview|finish [--yes] \"<project path relative to ${ROOT}>\""
+    echo "       rawproject list"
+    exit 1
+}
+
+slug() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_'
+}
+
+clean_path() {
+    local p="${1#/}"
+    p="${p%/}"
+    if [[ -z "$p" || "$p" == *..* || "$p" =~ [[:cntrl:]] ]]; then
+        echo "Invalid project path." >&2
+        exit 1
+    fi
+    local real
+    real="$(realpath -m "${ROOT}/${p}")"
+    if [[ "$real" != "${ROOT}/"* ]]; then
+        echo "Path resolves outside ${ROOT}." >&2
+        exit 1
+    fi
+    printf '%s' "$p"
+}
+
+ensure_parent() {
+    if ! zfs list -H -o name "$PARENT" >/dev/null 2>&1; then
+        zfs create -o canmount=off -o mountpoint=none \
+            -o recordsize=1M -o compression=lz4 -o atime=off "$PARENT"
+        echo "Created container dataset ${PARENT}"
+    fi
+}
+
+# Pull out the --yes flag so it can appear anywhere
+YES=0
+ARGS=()
+for a in "$@"; do
+    if [[ "$a" == "--yes" ]]; then
+        YES=1
+    else
+        ARGS+=("$a")
+    fi
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+cmd="${1:-}"
+case "$cmd" in
+    list)
+        zfs list -r -o name,used,refer,mountpoint "$PARENT"
+        ;;
+
+    create)
+        [[ $# -eq 2 ]] || usage
+        [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
+        rel="$(clean_path "$2")"
+        name="$(slug "$rel")"
+        ds="${PARENT}/${name}"
+        mp="${ROOT}/${rel}/Raw"
+
+        if zfs list -H -o name "$ds" >/dev/null 2>&1; then
+            echo "Dataset ${ds} already exists." >&2
+            exit 1
+        fi
+        if [[ -d "$mp" && -n "$(ls -A "$mp")" ]]; then
+            echo "${mp} exists and is not empty. Move or rename it first." >&2
+            exit 1
+        fi
+
+        ensure_parent
+        mkdir -p "${ROOT}/${rel}"
+        zfs create -o mountpoint="$mp" "$ds"
+        chown "${OWNER}:${OWNER}" "$mp"
+        chmod 775 "$mp"
+        echo "Created ${ds} mounted at ${mp}"
+        ;;
+
+    preview)
+        [[ $# -eq 2 ]] || usage
+        [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
+        rel="$(clean_path "$2")"
+        name="$(slug "$rel")"
+        ds="${PARENT}/${name}"
+
+        if ! zfs list -H -o name "$ds" >/dev/null 2>&1; then
+            echo "Dataset ${ds} does not exist." >&2
+            exit 1
+        fi
+        echo "This would permanently destroy ${ds} and all of its snapshots:"
+        zfs destroy -rnv "$ds"
+        ;;
+
+    finish)
+        [[ $# -eq 2 ]] || usage
+        [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
+        rel="$(clean_path "$2")"
+        name="$(slug "$rel")"
+        ds="${PARENT}/${name}"
+        mp="${ROOT}/${rel}/Raw"
+
+        if ! zfs list -H -o name "$ds" >/dev/null 2>&1; then
+            echo "Dataset ${ds} does not exist." >&2
+            exit 1
+        fi
+
+        if [[ $YES -ne 1 ]]; then
+            echo "This will permanently destroy ${ds} and all of its snapshots:"
+            zfs destroy -rnv "$ds"
+            echo
+            read -r -p "Type the dataset name to confirm (${name}): " answer
+            if [[ "$answer" != "$name" ]]; then
+                echo "Cancelled."
+                exit 1
+            fi
+        fi
+
+        # NFS clients and nfsd can pin the mount, so flush the export cache
+        # first and retry a few times before giving up.
+        errfile="$(mktemp)"
+        trap 'rm -f "$errfile"' EXIT
+        destroyed=0
+        for attempt in 1 2 3 4 5; do
+            exportfs -f 2>/dev/null || true
+            if zfs destroy -r "$ds" 2>"$errfile"; then
+                destroyed=1
+                break
+            fi
+            echo "Attempt ${attempt} failed: $(cat "$errfile")"
+            sleep 3
+        done
+
+        if [[ $destroyed -ne 1 ]]; then
+            echo "Dataset is still busy. Current holders of ${mp}:" >&2
+            fuser -vm "$mp" 2>&1 || true
+            echo "If a client still has it mounted, unmount the nested path there first." >&2
+            exit 1
+        fi
+
+        rmdir "$mp" 2>/dev/null || true
+        echo "Destroyed ${ds}. Space is free immediately."
+        ;;
+
+    *)
+        usage
+        ;;
+esac

@@ -1,0 +1,38 @@
+#!/bin/bash
+# rawproject-remote: forced command for the rawproj SSH user.
+# Accepts only: list | create <b64path> | preview <b64path> | finish <b64path> yes
+set -euo pipefail
+
+read -r -a REQ <<< "${SSH_ORIGINAL_COMMAND:-}"
+action="${REQ[0]:-}"
+b64="${REQ[1]:-}"
+confirm="${REQ[2]:-}"
+
+case "$action" in
+    list)
+        exec sudo /usr/local/bin/rawproject list
+        ;;
+    create|preview|finish)
+        if [[ ! "$b64" =~ ^[A-Za-z0-9+/=]+$ ]]; then
+            echo "Bad request." >&2
+            exit 1
+        fi
+        path="$(printf '%s' "$b64" | base64 -d)"
+        if [[ -z "$path" || "$path" == *$'\n'* ]]; then
+            echo "Bad path." >&2
+            exit 1
+        fi
+        if [[ "$action" == "finish" ]]; then
+            if [[ "$confirm" != "yes" ]]; then
+                echo "finish requires confirmation from the client." >&2
+                exit 1
+            fi
+            exec sudo /usr/local/bin/rawproject finish --yes "$path"
+        fi
+        exec sudo /usr/local/bin/rawproject "$action" "$path"
+        ;;
+    *)
+        echo "Not allowed." >&2
+        exit 1
+        ;;
+esac
