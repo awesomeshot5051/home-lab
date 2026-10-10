@@ -5,24 +5,82 @@ set -o pipefail
 LOG_FILE="${HOME:-/tmp}/tovinci.log"
 RUN_MARKER="=== RUN START"
 VERBOSE_LEVEL=0     # 0=quiet, 1=-v (steps + brief ffmpeg summary), 2=-vv (full live ffmpeg output)
-TARGET_TYPE=""      # optional override via -t
+TARGET_TYPE=""      # optional override via -t (wav, wav-16, wav-24, wav-32)
+BITS_OVERRIDE=""    # forced PCM bit depth via --bits N or -t wav-N (empty = match each source track)
 THREADED=false      # forced via --threaded
 JOBS=1              # concurrent files, via -j/--jobs
 AUTO_THREAD_BYTES=$((10 * 1024 * 1024 * 1024))  # 10GB auto-threading threshold
 GPU_REQUESTED=false # via -use-gpu=true
 GPU_HWACCEL=""      # detected backend: cuda / vaapi / qsv, empty = none available
 GPU_HWACCEL_DEVICE="" # e.g. /dev/dri/renderD128 for vaapi
+COMBINE=false       # via -c/--combine: merge all inputs into one video first
+COMBINE_NAME=""     # optional output name (no extension) for the combined video
+NO_CONVERT=false    # via --no-convert: only combine, skip DaVinci conversion (requires -c)
+COMBINE_AUDIO=false # via -ca/--combine-audio: mix all audio tracks/channels into one stereo track
+SPLIT_AUDIO=false   # via -sa/--split-audio: write each audio track as its own WAV (video-only .mov)
 
 usage() {
-    echo "Usage: $(basename "$0") [-v|-vv] [-t wav] [--threaded] [-j N|--jobs N] [-use-gpu=true|false] <file_or_pattern> [file_or_pattern ...]"
+    echo "Usage: $(basename "$0") [-v|-vv] [-t wav|wav-16|wav-24|wav-32] [--bits 16|24|32] [--threaded] [-j N|--jobs N] [-use-gpu=true|false] [-ca|--combine-audio] [-sa|--split-audio] [-c [NAME]|--combine[=NAME]] [--no-convert] <file_or_pattern> [file_or_pattern ...]"
     echo "  e.g. $(basename "$0") clip.mov"
     echo "       $(basename "$0") -v *.png                # step log + brief ffmpeg summary"
     echo "       $(basename "$0") -vv *.png               # full raw ffmpeg output, streamed live"
     echo "       $(basename "$0") -t wav song.mp3         # force audio-only, ignore embedded art/video"
+    echo "       $(basename "$0") -t wav-16 song.flac     # force audio-only AND 16-bit PCM"
+    echo "       $(basename "$0") -t wav-24 song.mp3      # force audio-only AND 24-bit PCM"
+    echo "       $(basename "$0") --bits 16 clip.mov      # normal conversion, but force 16-bit PCM audio"
     echo "       $(basename "$0") --threaded huge_clip.mov  # force multi-threaded encoding regardless of size"
     echo "       $(basename "$0") -j 4 *.mov              # process up to 4 files concurrently"
     echo "       $(basename "$0") -use-gpu=true clip.mov  # decode on GPU (NVDEC/VAAPI/QSV) if available; encode stays on CPU"
+    echo "       $(basename "$0") -ca clip.mov            # mix all audio tracks into one stereo track (default keeps them separate)"
+    echo "       $(basename "$0") -sa clip.mov            # video-only .mov plus one WAV per audio track (clip_davinci_a1.wav, ...)"
+    echo "       $(basename "$0") -c AceCombat8 a.mov b.mov   # combine, then convert -> AceCombat8.mov"
+    echo "       $(basename "$0") -c a.mov b.mov              # combine, then convert -> a_combined.mov"
+    echo "       $(basename "$0") -c AceCombat8 --no-convert a.mov b.mov  # combine only, no conversion"
+    echo "       $(basename "$0") -c -ca AceCombat8 a.mov b.mov           # combine, mix audio, then convert"
+    echo "       $(basename "$0") -c -sa AceCombat8 a.mov b.mov           # combine, then AceCombat8.mov + AceCombat8_a1.wav, _a2.wav"
+    echo "  PCM audio bit depth defaults to each source track's depth (lossy sources such as AAC become 16-bit)."
     exit 1
+}
+
+# --- Helpers used while parsing arguments ---
+has_media_ext() {
+    local arg="$1" ext
+    case "$arg" in
+        *.*) ;;
+        *) return 1 ;;
+    esac
+    ext=$(echo "${arg##*.}" | tr '[:upper:]' '[:lower:]')
+    case "$ext" in
+        mov|mp4|mkv|avi|webm|m4v|mpg|mpeg|ts|mts|m2ts|wmv|flv|mxf|ogv|3gp) return 0 ;;
+        mp3|wav|flac|aac|m4a|ogg|opus|wma|aif|aiff) return 0 ;;
+        jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2) return 0 ;;
+    esac
+    return 1
+}
+
+is_image_ext() {
+    local ext
+    ext=$(echo "${1##*.}" | tr '[:upper:]' '[:lower:]')
+    case "$ext" in
+        jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2) return 0 ;;
+    esac
+    return 1
+}
+
+# Decides whether the argument right after -c is the optional output name
+# (as opposed to the first input file). It is a name only if it is not another
+# option, not an existing file, not a glob pattern, and has no media extension.
+looks_like_name() {
+    local arg="$1"
+    case "$arg" in
+        -*) return 1 ;;
+    esac
+    [ -f "$arg" ] && return 1
+    case "$arg" in
+        *[\*\?\[]*) return 1 ;;
+    esac
+    has_media_ext "$arg" && return 1
+    return 0
 }
 
 # --- Pre-scan for long options (getopts can't parse --threaded / --jobs) ---
@@ -39,6 +97,39 @@ while [ "$#" -gt 0 ]; do
             ;;
         --jobs=*)
             JOBS="${1#--jobs=}"
+            shift
+            ;;
+        --bits)
+            BITS_OVERRIDE="${2:-}"
+            shift 2
+            ;;
+        --bits=*)
+            BITS_OVERRIDE="${1#--bits=}"
+            shift
+            ;;
+        -ca|--combine-audio)
+            COMBINE_AUDIO=true
+            shift
+            ;;
+        -sa|--split-audio)
+            SPLIT_AUDIO=true
+            shift
+            ;;
+        -c|--combine)
+            COMBINE=true
+            shift
+            if [ "$#" -gt 0 ] && looks_like_name "$1"; then
+                COMBINE_NAME="$1"
+                shift
+            fi
+            ;;
+        --combine=*)
+            COMBINE=true
+            COMBINE_NAME="${1#--combine=}"
+            shift
+            ;;
+        --no-convert)
+            NO_CONVERT=true
             shift
             ;;
         -use-gpu=*)
@@ -82,9 +173,24 @@ shift $((OPTIND - 1))
 
 if [ -n "$TARGET_TYPE" ]; then
     case "$TARGET_TYPE" in
-        wav) ;; # supported
+        wav) ;; # supported, bit depth follows the source
+        wav-16|wav-24|wav-32)
+            # Same audio-only mode as plain wav, with the bit depth forced.
+            BITS_OVERRIDE="${TARGET_TYPE#wav-}"
+            TARGET_TYPE="wav"
+            ;;
         *)
-            echo "Error: unsupported -t type '$TARGET_TYPE' (supported: wav)." >&2
+            echo "Error: unsupported -t type '$TARGET_TYPE' (supported: wav, wav-16, wav-24, wav-32)." >&2
+            usage
+            ;;
+    esac
+fi
+
+if [ -n "$BITS_OVERRIDE" ]; then
+    case "$BITS_OVERRIDE" in
+        16|24|32) ;;
+        *)
+            echo "Error: bit depth must be 16, 24 or 32 (got '$BITS_OVERRIDE')." >&2
             usage
             ;;
     esac
@@ -93,6 +199,38 @@ fi
 if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: -j/--jobs must be a positive integer (got '$JOBS')." >&2
     usage
+fi
+
+if [ "$NO_CONVERT" = true ] && [ "$COMBINE" != true ]; then
+    echo "Error: --no-convert can only be used together with -c/--combine." >&2
+    usage
+fi
+
+if [ "$NO_CONVERT" = true ] && [ "$COMBINE_AUDIO" = true ]; then
+    echo "Error: -ca/--combine-audio cannot be used with --no-convert (mixing audio requires re-encoding it)." >&2
+    usage
+fi
+
+if [ "$NO_CONVERT" = true ] && [ "$SPLIT_AUDIO" = true ]; then
+    echo "Error: -sa/--split-audio cannot be used with --no-convert (splitting audio requires re-encoding it)." >&2
+    usage
+fi
+
+if [ "$COMBINE_AUDIO" = true ] && [ "$SPLIT_AUDIO" = true ]; then
+    echo "Error: -ca/--combine-audio and -sa/--split-audio contradict each other (mix into one vs. one file per track)." >&2
+    usage
+fi
+
+if [ "$NO_CONVERT" = true ] && [ -n "$BITS_OVERRIDE" ]; then
+    echo "Error: a forced bit depth cannot be used with --no-convert (audio is stream-copied untouched)." >&2
+    usage
+fi
+
+# If the combined name was given with a media extension, drop it. The extension
+# is always chosen by the script (.mov/.wav when converting, the first input's
+# extension when using --no-convert).
+if [ -n "$COMBINE_NAME" ] && has_media_ext "$COMBINE_NAME"; then
+    COMBINE_NAME="${COMBINE_NAME%.*}"
 fi
 
 if [ "$#" -eq 0 ]; then
@@ -145,7 +283,7 @@ detect_gpu_hwaccel() {
     return 1
 }
 
-if [ "$GPU_REQUESTED" = true ]; then
+if [ "$GPU_REQUESTED" = true ] && [ "$NO_CONVERT" != true ]; then
     if detect_gpu_hwaccel; then
         echo "GPU-accelerated decode enabled (backend: $GPU_HWACCEL). DNxHR encoding itself still runs on the CPU - ffmpeg has no GPU encoder for that codec." >&2
     else
@@ -178,6 +316,20 @@ if [ "${#FILES[@]}" -eq 0 ]; then
 fi
 
 TOTAL=${#FILES[@]}
+
+if [ "$COMBINE" = true ]; then
+    if [ "$TOTAL" -lt 2 ]; then
+        echo "Error: -c/--combine needs at least 2 valid input files (found $TOTAL)." >&2
+        exit 1
+    fi
+    # Combining produces exactly one output, so concurrency does not apply.
+    JOBS=1
+fi
+
+# Scratch space for per-file status codes and the (tiny) concat list file.
+STATUS_DIR=$(mktemp -d)
+cleanup_status_dir() { rm -rf "$STATUS_DIR"; }
+trap cleanup_status_dir EXIT
 
 if ! touch "$LOG_FILE" 2>/dev/null; then
     OLD_LOG_FILE="$LOG_FILE"
@@ -221,7 +373,9 @@ notify() {
     echo "$(line_prefix)$1"
 }
 
-if [ "$TOTAL" -eq 1 ]; then
+if [ "$COMBINE" = true ]; then
+    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: combine $TOTAL files ==="
+elif [ "$TOTAL" -eq 1 ]; then
     log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: '${FILES[0]}' ==="
 else
     log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: $TOTAL files (jobs=$JOBS) ==="
@@ -232,19 +386,205 @@ get_file_size() {
     stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
 }
 
+# --- Runs ffmpeg with the given arguments (everything after "ffmpeg -y"),
+#     honoring the current -v/-vv verbosity level. ---
+run_ffmpeg_cmd() {
+    local status=0
+    if [ "$VERBOSE_LEVEL" -ge 2 ]; then
+        # -vv: stream everything ffmpeg prints, live, straight to the terminal and log.
+        ffmpeg -y "$@" 2>&1 | tee -a "$LOG_FILE" || status=$?
+    elif [ "$VERBOSE_LEVEL" -eq 1 ]; then
+        # -v: show ffmpeg's live progress line (frame/fps/q/size/time/bitrate/
+        # speed) updating in real time as it encodes, without the banner,
+        # input/output metadata dump, or stream-mapping noise. -stats is
+        # passed explicitly because ffmpeg otherwise suppresses that live
+        # progress output whenever stdout/stderr isn't a real terminal (e.g.
+        # piped through tee, as it is here).
+        ffmpeg -y -hide_banner -loglevel error -stats "$@" 2>&1 | tee -a "$LOG_FILE" || status=$?
+    else
+        # default: fully quiet, everything goes to the log only.
+        ffmpeg -y -loglevel error "$@" >> "$LOG_FILE" 2>&1 || status=$?
+    fi
+    return "$status"
+}
+
+# --- Prints the PCM codec to use for audio track $2 (0-based) of file $1.
+#     A forced depth (--bits / -t wav-N) wins. Otherwise the depth matches the
+#     source track: bits_per_raw_sample when the source reports it (PCM, FLAC,
+#     ALAC), else the sample format. Lossy sources (AAC, MP3, Opus, Vorbis...)
+#     decode to float and map to 16-bit, since more bits add size but no
+#     fidelity. 8-bit and 12/16-bit sources map to 16, 20/24 to 24, deeper to 32. ---
+pcm_codec_for_track() {
+    local file="$1" idx="$2" bits="" codec="" fmt="" raw="" key val
+
+    if [ -n "$BITS_OVERRIDE" ]; then
+        echo "pcm_s${BITS_OVERRIDE}le"
+        return 0
+    fi
+
+    while IFS='=' read -r key val; do
+        case "$key" in
+            codec_name) codec="$val" ;;
+            sample_fmt) fmt="$val" ;;
+            bits_per_raw_sample) raw="$val" ;;
+        esac
+    done < <(ffprobe -v error -select_streams "a:$idx" -show_entries stream=codec_name,sample_fmt,bits_per_raw_sample -of default=noprint_wrappers=1 "$file" 2>/dev/null || true)
+
+    if [[ "$raw" =~ ^[0-9]+$ ]] && [ "$raw" -gt 0 ]; then
+        if [ "$raw" -le 16 ]; then
+            bits=16
+        elif [ "$raw" -le 24 ]; then
+            bits=24
+        else
+            bits=32
+        fi
+    else
+        case "$fmt" in
+            u8|u8p|s16|s16p) bits=16 ;;
+            s32|s32p) bits=32 ;;
+            flt|fltp|dbl|dblp)
+                case "$codec" in
+                    pcm_f*) bits=32 ;;
+                    *) bits=16 ;;
+                esac
+                ;;
+            *) bits=16 ;;
+        esac
+    fi
+
+    echo "pcm_s${bits}le"
+}
+
+# --- Builds the audio codec arguments into AUDIO_CODEC_ARGS, matching the
+#     source depth per track (or the forced depth). Uses AUDIO_COUNT,
+#     INPUT_FILE and AUDIO_CODEC_ARGS from the calling process_one_file
+#     (bash dynamic scoping).
+#       $1 = "video" (output .mov may hold several audio tracks, so each gets
+#                     its own codec via -c:a:N)
+#            "audio" (single WAV stream)
+#     When tracks are mixed with -ca there is only one output stream, so the
+#     codec follows the first track. ---
+set_audio_codec_args() {
+    local kind="$1" i codec
+    AUDIO_CODEC_ARGS=()
+
+    if [ "$kind" = "video" ] && [ "$AUDIO_COUNT" -gt 1 ] && [ "$COMBINE_AUDIO" != true ]; then
+        for ((i = 0; i < AUDIO_COUNT; i++)); do
+            codec=$(pcm_codec_for_track "$INPUT_FILE" "$i")
+            AUDIO_CODEC_ARGS+=("-c:a:$i" "$codec")
+        done
+    else
+        codec=$(pcm_codec_for_track "$INPUT_FILE" 0)
+        AUDIO_CODEC_ARGS=(-c:a "$codec")
+    fi
+
+    if [ -n "$BITS_OVERRIDE" ]; then
+        log "Audio bit depth forced to ${BITS_OVERRIDE}-bit: ${AUDIO_CODEC_ARGS[*]}"
+    else
+        log "Audio bit depth matched to source: ${AUDIO_CODEC_ARGS[*]}"
+    fi
+}
+
+# --- Builds the audio stream selection for the output, into AUDIO_SEL_ARGS.
+#     Uses AUDIO_COUNT and INPUT_FILE from the calling process_one_file
+#     (bash dynamic scoping).
+#       $1 = "video" (output container can hold several audio tracks)
+#            "audio" (output is a WAV, which can only hold one stream)
+#     Default behavior keeps every audio track separate (e.g. mic + game
+#     audio). With -ca/--combine-audio all tracks are mixed into one stereo
+#     track instead. ---
+build_audio_args() {
+    local kind="$1" i filt="" channels
+    AUDIO_SEL_ARGS=()
+
+    if [ "$AUDIO_COUNT" -gt 1 ]; then
+        if [ "$COMBINE_AUDIO" = true ]; then
+            for ((i = 0; i < AUDIO_COUNT; i++)); do
+                filt+="[0:a:$i]"
+            done
+            # normalize=0 keeps each track at its original level instead of
+            # dividing the volume by the number of inputs.
+            filt+="amix=inputs=${AUDIO_COUNT}:duration=longest:normalize=0[aout]"
+            log "Combine-audio enabled. Mixing $AUDIO_COUNT audio tracks into one stereo track."
+            AUDIO_SEL_ARGS=(-filter_complex "$filt" -map "[aout]" -ac 2)
+        elif [ "$kind" = "video" ]; then
+            log "$AUDIO_COUNT audio tracks detected. Keeping them as separate tracks (use -ca to mix them into one)."
+            AUDIO_SEL_ARGS=(-map 0:a)
+        else
+            echo "Warning: '$INPUT_FILE' has $AUDIO_COUNT audio tracks but WAV output holds only one. Using the first track (use -ca to mix them all, or -sa to write one WAV per track)." >&2
+            log "Audio-only output holds a single stream. Using the first of $AUDIO_COUNT audio tracks."
+            AUDIO_SEL_ARGS=(-map 0:a:0)
+        fi
+    else
+        AUDIO_SEL_ARGS=(-map 0:a:0)
+        if [ "$COMBINE_AUDIO" = true ]; then
+            channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=nk=1:nw=1 "$INPUT_FILE" 2>/dev/null || true)
+            if [[ "$channels" =~ ^[0-9]+$ ]] && [ "$channels" -gt 2 ]; then
+                log "Combine-audio enabled. Downmixing $channels channels to stereo."
+                AUDIO_SEL_ARGS+=(-ac 2)
+            else
+                log "Combine-audio enabled, but there is only one audio track with $channels channel(s). Nothing to mix."
+            fi
+        fi
+    fi
+}
+
+# --- Appends one extra WAV output per audio track to EXTRA_OUT_ARGS (and the
+#     file names to EXTRA_OUT_FILES), starting at track index $1, named
+#     <stem>_a1.wav, <stem>_a2.wav, ... Uses AUDIO_COUNT, INPUT_FILE,
+#     EXTRA_OUT_ARGS and EXTRA_OUT_FILES from the calling process_one_file
+#     (dynamic scoping). Each extra output is its own ffmpeg output in the
+#     same single pass, and each track gets the PCM depth of its own source
+#     track (or the forced depth). ---
+build_split_outputs() {
+    local start="$1" stem="$2" i wav codec
+    for ((i = start; i < AUDIO_COUNT; i++)); do
+        wav="${stem}_a$((i + 1)).wav"
+        codec=$(pcm_codec_for_track "$INPUT_FILE" "$i")
+        log "Split track $((i + 1)) -> '$wav' ($codec)"
+        EXTRA_OUT_ARGS+=(-map "0:a:$i" -c:a "$codec" "$wav")
+        EXTRA_OUT_FILES+=("$wav")
+    done
+}
+
+# process_one_file INPUT [OUTPUT_STEM] [CONCAT_LIST] [SIZE_OVERRIDE]
+#   INPUT         file to analyze (in combine mode: the first clip, used for probing)
+#   OUTPUT_STEM   optional output name without extension (default: <name>_davinci)
+#   CONCAT_LIST   optional ffmpeg concat list; when set, ffmpeg reads the combined
+#                 clips from it instead of INPUT, in a single pass
+#   SIZE_OVERRIDE optional total input size in bytes (for the 10GB threading check)
 process_one_file() {
     local INPUT_FILE="$1"
+    local OUTPUT_STEM_OVERRIDE="${2:-}"
+    local CONCAT_LIST="${3:-}"
+    local SIZE_OVERRIDE="${4:-}"
     CURRENT_FILE="$INPUT_FILE"
 
     log "Analyzing '$INPUT_FILE'..."
 
-    local FILENAME EXTENSION BASENAME EXT_LOWER IS_IMAGE OUTPUT_FILE FILE_SIZE USE_THREADS
-    local -a FFMPEG_ARGS FFMPEG_PRE_ARGS
+    local FILENAME EXTENSION BASENAME EXT_LOWER IS_IMAGE OUTPUT_FILE OUTPUT_STEM FILE_SIZE USE_THREADS AUDIO_COUNT
+    local -a FFMPEG_ARGS FFMPEG_PRE_ARGS FFMPEG_IN_ARGS AUDIO_SEL_ARGS AUDIO_CODEC_ARGS EXTRA_OUT_ARGS EXTRA_OUT_FILES
     FFMPEG_PRE_ARGS=()
+    AUDIO_SEL_ARGS=()
+    AUDIO_CODEC_ARGS=()
+    EXTRA_OUT_ARGS=()
+    EXTRA_OUT_FILES=()
     FILENAME=$(basename -- "$INPUT_FILE")
     EXTENSION="${FILENAME##*.}"
     BASENAME="${FILENAME%.*}"
     EXT_LOWER=$(echo "$EXTENSION" | tr '[:upper:]' '[:lower:]')
+
+    OUTPUT_STEM="${BASENAME}_davinci"
+    if [ -n "$OUTPUT_STEM_OVERRIDE" ]; then
+        OUTPUT_STEM="$OUTPUT_STEM_OVERRIDE"
+    fi
+
+    if [ -n "$CONCAT_LIST" ]; then
+        log "Combined input: stream settings are probed from '$INPUT_FILE', clips are read via concat list."
+        FFMPEG_IN_ARGS=(-f concat -safe 0 -i "$CONCAT_LIST")
+    else
+        FFMPEG_IN_ARGS=(-i "$INPUT_FILE")
+    fi
 
     IS_IMAGE=false
     case "$EXT_LOWER" in
@@ -253,17 +593,28 @@ process_one_file() {
             ;;
     esac
 
-    FILE_SIZE=$(get_file_size "$INPUT_FILE")
+    if [ -n "$SIZE_OVERRIDE" ]; then
+        FILE_SIZE="$SIZE_OVERRIDE"
+    else
+        FILE_SIZE=$(get_file_size "$INPUT_FILE")
+    fi
     USE_THREADS=false
     if [ "$THREADED" = true ] || [ "$FILE_SIZE" -ge "$AUTO_THREAD_BYTES" ]; then
         USE_THREADS=true
+    fi
+
+    # Number of audio streams (tracks) in the source, e.g. 2 when a recording
+    # has separate mic and desktop-audio tracks.
+    AUDIO_COUNT=0
+    if [ "$IS_IMAGE" != true ]; then
+        AUDIO_COUNT=$({ ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$INPUT_FILE" 2>/dev/null || true; } | wc -l | tr -d ' ')
     fi
 
     FFMPEG_ARGS=()
 
     if [ "$IS_IMAGE" = true ]; then
         log "Image file detected. Automagically configuring for DaVinci Resolve image compatibility..."
-        OUTPUT_FILE="${BASENAME}_davinci.jpg"
+        OUTPUT_FILE="${OUTPUT_STEM}.jpg"
         log "Converting to high-quality JPEG..."
         FFMPEG_ARGS=(-pix_fmt yuvj420p -q:v 2 -update 1)
         # Single-frame encode - threading doesn't help here, so it's skipped
@@ -282,10 +633,19 @@ process_one_file() {
         fi
 
         log "Forced audio-only mode (-t wav). Automagically configuring for DaVinci Resolve Linux audio compatibility..."
-        OUTPUT_FILE="${BASENAME}_davinci.wav"
-        # -vn drops any video/attached-picture stream so it doesn't get
-        # dragged along and rejected by the WAV muxer.
-        FFMPEG_ARGS=(-vn -c:a pcm_s24le)
+        OUTPUT_FILE="${OUTPUT_STEM}.wav"
+        set_audio_codec_args audio
+        if [ "$SPLIT_AUDIO" = true ] && [ "$AUDIO_COUNT" -gt 1 ]; then
+            log "Split-audio enabled. Writing each of the $AUDIO_COUNT audio tracks as its own WAV."
+            OUTPUT_FILE="${OUTPUT_STEM}_a1.wav"
+            FFMPEG_ARGS=(-vn -map 0:a:0 "${AUDIO_CODEC_ARGS[@]}")
+            build_split_outputs 1 "$OUTPUT_STEM"
+        else
+            build_audio_args audio
+            # -vn drops any video/attached-picture stream so it doesn't get
+            # dragged along and rejected by the WAV muxer.
+            FFMPEG_ARGS=(-vn "${AUDIO_SEL_ARGS[@]}" "${AUDIO_CODEC_ARGS[@]}")
+        fi
         # PCM audio encoding is not thread-parallelizable in ffmpeg, so
         # -threads is not applied here even if USE_THREADS is true.
 
@@ -297,20 +657,31 @@ process_one_file() {
 
         if [ -z "$HAS_VIDEO" ] && [ "$HAS_AUDIO" = "audio" ]; then
             log "Sole audio file detected. Automagically configuring for DaVinci Resolve Linux audio compatibility..."
-            OUTPUT_FILE="${BASENAME}_davinci.wav"
-            FFMPEG_ARGS=(-c:a pcm_s24le)
+            OUTPUT_FILE="${OUTPUT_STEM}.wav"
+            set_audio_codec_args audio
+            if [ "$SPLIT_AUDIO" = true ] && [ "$AUDIO_COUNT" -gt 1 ]; then
+                log "Split-audio enabled. Writing each of the $AUDIO_COUNT audio tracks as its own WAV."
+                OUTPUT_FILE="${OUTPUT_STEM}_a1.wav"
+                FFMPEG_ARGS=(-map 0:a:0 "${AUDIO_CODEC_ARGS[@]}")
+                build_split_outputs 1 "$OUTPUT_STEM"
+            else
+                build_audio_args audio
+                FFMPEG_ARGS=("${AUDIO_SEL_ARGS[@]}" "${AUDIO_CODEC_ARGS[@]}")
+            fi
         else
-            OUTPUT_FILE="${BASENAME}_davinci.mov"
+            OUTPUT_FILE="${OUTPUT_STEM}.mov"
 
             PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nk=1:nw=1 "$INPUT_FILE")
             log "Detected source pixel format: $PIX_FMT"
 
+            # -map 0:v:0 picks the first video stream explicitly; audio streams
+            # are selected below so no track is silently dropped.
             if [[ "$PIX_FMT" == *"10"* || "$PIX_FMT" == *"12"* || "$PIX_FMT" == *"le"* ]]; then
                 log "High bit-depth detected. Transcoding to 10-bit DNxHR HQX..."
-                FFMPEG_ARGS=(-c:v dnxhd -profile:v dnxhr_hqx -pix_fmt yuv422p10le)
+                FFMPEG_ARGS=(-map 0:v:0 -c:v dnxhd -profile:v dnxhr_hqx -pix_fmt yuv422p10le)
             else
                 log "Standard bit-depth detected. Transcoding to 8-bit DNxHR HQ..."
-                FFMPEG_ARGS=(-c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p)
+                FFMPEG_ARGS=(-map 0:v:0 -c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p)
             fi
 
             if [ "$USE_THREADS" = true ]; then
@@ -338,8 +709,16 @@ process_one_file() {
             fi
 
             if [ "$HAS_AUDIO" = "audio" ]; then
-                log "Audio stream detected. Retaining uncompressed audio."
-                FFMPEG_ARGS+=(-c:a pcm_s16le)
+                if [ "$SPLIT_AUDIO" = true ] && [ "$AUDIO_COUNT" -gt 1 ]; then
+                    log "Split-audio enabled. Video-only .mov plus one WAV per audio track ($AUDIO_COUNT tracks)."
+                    FFMPEG_ARGS+=(-an)
+                    build_split_outputs 0 "$OUTPUT_STEM"
+                else
+                    log "Audio stream detected. Retaining uncompressed audio."
+                    build_audio_args video
+                    set_audio_codec_args video
+                    FFMPEG_ARGS+=("${AUDIO_SEL_ARGS[@]}" "${AUDIO_CODEC_ARGS[@]}")
+                fi
             else
                 log "No audio stream detected. Stripping audio track."
                 FFMPEG_ARGS+=(-an)
@@ -348,34 +727,11 @@ process_one_file() {
     fi
 
     log "Running FFmpeg command..."
-    log "ffmpeg ${FFMPEG_PRE_ARGS[*]} -i \"$INPUT_FILE\" ${FFMPEG_ARGS[*]} \"$OUTPUT_FILE\""
+    log "ffmpeg ${FFMPEG_PRE_ARGS[*]} ${FFMPEG_IN_ARGS[*]} ${FFMPEG_ARGS[*]} \"$OUTPUT_FILE\" ${EXTRA_OUT_ARGS[*]}"
     log "--------------------------------------------------------"
 
-    # Runs ffmpeg with the current FFMPEG_PRE_ARGS/FFMPEG_ARGS (both visible
-    # here via bash's dynamic scoping, since this is only ever called from
-    # within process_one_file), honoring the current -v/-vv verbosity level.
-    run_ffmpeg() {
-        local status=0
-        if [ "$VERBOSE_LEVEL" -ge 2 ]; then
-            # -vv: stream everything ffmpeg prints, live, straight to the terminal and log.
-            ffmpeg -y "${FFMPEG_PRE_ARGS[@]}" -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" || status=$?
-        elif [ "$VERBOSE_LEVEL" -eq 1 ]; then
-            # -v: show ffmpeg's live progress line (frame/fps/q/size/time/bitrate/
-            # speed) updating in real time as it encodes, without the banner,
-            # input/output metadata dump, or stream-mapping noise. -stats is
-            # passed explicitly because ffmpeg otherwise suppresses that live
-            # progress output whenever stdout/stderr isn't a real terminal (e.g.
-            # piped through tee, as it is here).
-            ffmpeg -y -hide_banner -loglevel error -stats "${FFMPEG_PRE_ARGS[@]}" -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" || status=$?
-        else
-            # default: fully quiet, everything goes to the log only.
-            ffmpeg -y -loglevel error "${FFMPEG_PRE_ARGS[@]}" -i "$INPUT_FILE" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" >> "$LOG_FILE" 2>&1 || status=$?
-        fi
-        return "$status"
-    }
-
     local FFMPEG_STATUS=0
-    run_ffmpeg || FFMPEG_STATUS=$?
+    run_ffmpeg_cmd "${FFMPEG_PRE_ARGS[@]}" "${FFMPEG_IN_ARGS[@]}" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" "${EXTRA_OUT_ARGS[@]}" || FFMPEG_STATUS=$?
 
     if [ "$FFMPEG_STATUS" -ne 0 ] && [ "${#FFMPEG_PRE_ARGS[@]}" -gt 0 ]; then
         # GPU-accelerated decode failed (unsupported source codec, no actual
@@ -384,7 +740,7 @@ process_one_file() {
         log "GPU-accelerated decode failed (exit code $FFMPEG_STATUS) for '$INPUT_FILE'. Retrying with CPU decode..."
         FFMPEG_PRE_ARGS=()
         FFMPEG_STATUS=0
-        run_ffmpeg || FFMPEG_STATUS=$?
+        run_ffmpeg_cmd "${FFMPEG_IN_ARGS[@]}" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" "${EXTRA_OUT_ARGS[@]}" || FFMPEG_STATUS=$?
     fi
 
     if [ "$FFMPEG_STATUS" -ne 0 ]; then
@@ -400,15 +756,140 @@ process_one_file() {
 
     log "--------------------------------------------------------"
     notify "Done! Highly compatible file created: '$OUTPUT_FILE'"
+    local extra
+    for extra in "${EXTRA_OUT_FILES[@]}"; do
+        notify "Done! Separate audio track created: '$extra'"
+    done
     return 0
 }
 
+# --- Resolves a path to an absolute path (needed for the concat list file) ---
+abs_path() {
+    local d b
+    d=$(cd "$(dirname -- "$1")" && pwd) || return 1
+    b=$(basename -- "$1")
+    printf '%s/%s' "$d" "$b"
+}
+
+# --- Describes the stream layout of a file (the first video stream and ALL
+#     audio streams) so clips can be checked for compatibility before they are
+#     concatenated. ---
+stream_signature() {
+    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,pix_fmt,r_frame_rate -of csv=p=0 "$1" 2>/dev/null || true
+    ffprobe -v error -select_streams a -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 "$1" 2>/dev/null || true
+}
+
+# --- Combine mode: merge all FILES into one video. Unless --no-convert is set,
+#     the merged result is converted to the DaVinci format in the same single
+#     ffmpeg pass (no large intermediate file is written). ---
+run_combine() {
+    local f cand first_file first_name first_ext stem out list_file p esc sq size sig ref_sig total_size
+    local -a CANDIDATES
+    first_file="${FILES[0]}"
+    CURRENT_FILE="$first_file"
+    first_name=$(basename -- "$first_file")
+    first_ext="${first_name##*.}"
+
+    # Images can't be combined into a video.
+    for f in "${FILES[@]}"; do
+        if is_image_ext "$f"; then
+            echo "Error: -c/--combine only supports video/audio files, but '$f' is an image." >&2
+            return 1
+        fi
+    done
+
+    # Work out the output name.
+    if [ -n "$COMBINE_NAME" ]; then
+        stem="$COMBINE_NAME"
+    else
+        stem="${first_name%.*}_combined"
+    fi
+
+    if [ "$NO_CONVERT" = true ]; then
+        out="${stem}.${first_ext}"
+        CANDIDATES=("$out")
+    else
+        out="${stem}.mov"
+        CANDIDATES=("${stem}.mov" "${stem}.wav" "${stem}_a1.wav" "${stem}_a2.wav" "${stem}_a3.wav" "${stem}_a4.wav")
+    fi
+
+    # Never overwrite one of the inputs.
+    for cand in "${CANDIDATES[@]}"; do
+        for f in "${FILES[@]}"; do
+            if [ "$cand" -ef "$f" ]; then
+                echo "Error: the combined output '$cand' would overwrite input file '$f'. Pick a different name." >&2
+                return 1
+            fi
+        done
+    done
+
+    # Verify the clips share the same stream layout, since concatenation
+    # requires matching codec/resolution/frame rate/audio parameters and the
+    # same number of audio tracks.
+    ref_sig=$(stream_signature "$first_file")
+    for f in "${FILES[@]}"; do
+        sig=$(stream_signature "$f")
+        if [ "$sig" != "$ref_sig" ]; then
+            echo "Error: '$f' does not match the stream layout of '$first_file' (codec, resolution, pixel format, frame rate, audio parameters, or number of audio tracks differ)." >&2
+            echo "All clips must share the same settings to be combined without re-encoding each one first." >&2
+            return 1
+        fi
+    done
+
+    # Build the ffmpeg concat list with absolute paths, in the order given.
+    list_file="$STATUS_DIR/concat.txt"
+    : > "$list_file"
+    sq="'"
+    total_size=0
+    for f in "${FILES[@]}"; do
+        p=$(abs_path "$f") || { echo "Error: could not resolve path for '$f'." >&2; return 1; }
+        esc="${p//$sq/$sq\\$sq$sq}"
+        printf "file '%s'\n" "$esc" >> "$list_file"
+        size=$(get_file_size "$f")
+        total_size=$((total_size + size))
+    done
+
+    log "Combining $TOTAL files into '$out' (in the order given):"
+    for f in "${FILES[@]}"; do
+        log "  - $f"
+    done
+
+    if [ "$NO_CONVERT" = true ]; then
+        log "--no-convert set. Combining with stream copy only, no DaVinci conversion. All audio tracks are kept as-is."
+        log "ffmpeg -f concat -safe 0 -i \"$list_file\" -map 0:v? -map 0:a? -c copy \"$out\""
+        log "--------------------------------------------------------"
+
+        local FFMPEG_STATUS=0
+        run_ffmpeg_cmd -f concat -safe 0 -i "$list_file" -map "0:v?" -map "0:a?" -c copy "$out" || FFMPEG_STATUS=$?
+
+        if [ "$FFMPEG_STATUS" -ne 0 ]; then
+            trap - ERR
+            echo "Error: ffmpeg failed (exit code $FFMPEG_STATUS) while combining files." >&2
+            if [ "$VERBOSE_LEVEL" -lt 2 ]; then
+                echo "Last few lines of ffmpeg output:" >&2
+                tail -n 10 "$LOG_FILE" >&2
+            fi
+            echo "Full details: $LOG_FILE" >&2
+            return "$FFMPEG_STATUS"
+        fi
+
+        log "--------------------------------------------------------"
+        notify "Done! Combined file created: '$out'"
+        return 0
+    fi
+
+    log "Combining and converting to DaVinci format in a single pass."
+    process_one_file "$first_file" "$stem" "$list_file" "$total_size"
+}
+
+if [ "$COMBINE" = true ]; then
+    COMBINE_STATUS=0
+    run_combine || COMBINE_STATUS=$?
+    exit "$COMBINE_STATUS"
+fi
+
 declare -a FAILED_FILES=()
 SUCCESS_COUNT=0
-
-STATUS_DIR=$(mktemp -d)
-cleanup_status_dir() { rm -rf "$STATUS_DIR"; }
-trap cleanup_status_dir EXIT
 
 i=0
 for f in "${FILES[@]}"; do
@@ -453,3 +934,4 @@ if [ "${#FAILED_FILES[@]}" -ne 0 ]; then
     exit 1
 fi
 exit 0
+
