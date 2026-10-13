@@ -1,0 +1,144 @@
+#!/bin/bash
+# audiobackup (runs on traes-pc)
+# Records whatever is playing on the default output as a backup audio file.
+# Uses pw-record (PipeWire), CPU only, no GPU.
+# It follows the default output, so switching from speakers to headphones
+# in the middle of a session does not cause silence.
+#
+# Usage:
+#   audiobackup                              start recording, Ctrl+C to stop
+#   audiobackup "Mission 3"                  same, with a name added to the file name
+#   audiobackup -n NAME -d DIR -- COMMAND    record for as long as COMMAND runs
+#
+# Steam launch options example:
+#   audiobackup -n "Ace Combat 7" -d "/home/awesomeshot5051/AudioBackup/AceCombat7" -- %command%
+#
+# Options:
+#   -n, --name NAME     name added to the file name
+#   -d, --dir DIR       output folder (overrides AUDIOBACKUP_DIR)
+#   -s, --sink SINK     record one specific output instead of following the default
+#
+# Optional environment variables:
+#   AUDIOBACKUP_DIR        output folder (default ~/AudioBackup, keep this on the primary drive)
+#   AUDIOBACKUP_SINK       record one specific output instead of following the default
+#   AUDIOBACKUP_EXT        file type, flac (default) or wav
+#   AUDIOBACKUP_KEEP_DAYS  delete old backup files (same file type) in the output
+#                          folder when a recording starts (default 0, meaning never delete)
+set -u
+
+OUT_DIR="${AUDIOBACKUP_DIR:-${HOME}/AudioBackup}"
+SINK="${AUDIOBACKUP_SINK:-}"
+EXT="${AUDIOBACKUP_EXT:-flac}"
+KEEP_DAYS="${AUDIOBACKUP_KEEP_DAYS:-0}"
+name=""
+cmd=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--name) name="${2:-}"; shift 2 ;;
+        -d|--dir)  OUT_DIR="${2:-}"; shift 2 ;;
+        -s|--sink) SINK="${2:-}"; shift 2 ;;
+        --)        shift; cmd=("$@"); break ;;
+        *)         name="$1"; shift ;;
+    esac
+done
+
+# Expand a leading ~ in the output folder
+OUT_DIR="${OUT_DIR/#\~/$HOME}"
+
+# Never let a backup problem stop the game from launching
+run_game() {
+    if [[ ${#cmd[@]} -gt 0 ]]; then
+        exec "${cmd[@]}"
+    fi
+}
+
+if ! command -v pw-record >/dev/null 2>&1; then
+    echo "audiobackup: missing required tool: pw-record" >&2
+    run_game
+    exit 1
+fi
+
+# Steam puts its own runtime libraries in LD_LIBRARY_PATH and a 32-bit overlay in
+# LD_PRELOAD. Host tools must not see them, or they can load the wrong libraries
+# and fail. This is only applied to pw-record, never to the game.
+record_cmd=(env -u LD_LIBRARY_PATH -u LD_PRELOAD
+    pw-record -P stream.capture.sink=true --rate 48000 --channels 2)
+if [[ -n "$SINK" ]]; then
+    record_cmd+=(--target "$SINK")
+fi
+
+stamp="$(date +%Y-%m-%d_%H-%M-%S)"
+if [[ -n "$name" ]]; then
+    safe_name="${name//[^A-Za-z0-9._-]/_}"
+    file="${OUT_DIR}/${stamp}_${safe_name}.${EXT}"
+else
+    file="${OUT_DIR}/${stamp}.${EXT}"
+fi
+
+if ! mkdir -p -- "$OUT_DIR"; then
+    echo "audiobackup: cannot create ${OUT_DIR}" >&2
+    run_game
+    exit 1
+fi
+
+if [[ "$KEEP_DAYS" =~ ^[0-9]+$ && "$KEEP_DAYS" -gt 0 ]]; then
+    find "$OUT_DIR" -maxdepth 1 -type f -name "*.${EXT}" -mtime "+${KEEP_DAYS}" -delete 2>/dev/null || true
+fi
+
+# Terminal mode: no command given, record in the foreground until Ctrl+C
+if [[ ${#cmd[@]} -eq 0 ]]; then
+    echo "Recording the default output (follows device changes)"
+    echo "Writing:   ${file}"
+    echo "Press Ctrl+C to stop."
+    echo
+    exec "${record_cmd[@]}" "$file"
+fi
+
+# Wrapper mode: record in the background while the command runs
+log="${file%.*}.log"
+"${record_cmd[@]}" "$file" >"$log" 2>&1 &
+recpid=$!
+
+stop_recording() {
+    if kill -0 "$recpid" 2>/dev/null; then
+        # SIGTERM makes pw-record finish the file cleanly
+        kill -TERM "$recpid" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            kill -0 "$recpid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL "$recpid" 2>/dev/null || true
+    fi
+    wait "$recpid" 2>/dev/null || true
+    # Keep the log only if pw-record actually printed something
+    if [[ -f "$log" && ! -s "$log" ]]; then
+        rm -f -- "$log"
+    fi
+}
+
+game_pid=""
+forward_signal() {
+    if [[ -n "$game_pid" ]]; then
+        kill -TERM "$game_pid" 2>/dev/null || true
+    fi
+}
+trap forward_signal TERM INT HUP
+trap stop_recording EXIT
+
+# Give pw-record a moment to attach, and warn if it failed to start
+sleep 1
+if ! kill -0 "$recpid" 2>/dev/null; then
+    echo "audiobackup: pw-record failed to start, see ${log}" >&2
+fi
+
+"${cmd[@]}" &
+game_pid=$!
+wait "$game_pid"
+status=$?
+# A trapped signal interrupts the first wait, so wait again for the real exit status
+if kill -0 "$game_pid" 2>/dev/null; then
+    wait "$game_pid"
+    status=$?
+fi
+exit "$status"
