@@ -1,0 +1,44 @@
+#!/bin/bash
+
+TARGET_DIR="/mnt/Data/GUI/src"
+PROP_FILE="$TARGET_DIR/main/resources/default-config.properties"
+# Only touch the files that have hardcoded strings
+JAVA_FILES=(
+    "$TARGET_DIR/main/java/com/awesomeshot5051/separatedFiles/InitialStart/ClientRegistration.java"
+    "$TARGET_DIR/main/java/com/awesomeshot5051/separatedFiles/ServerManagement/WoLTrigger.java"
+)
+
+apply_mode() {
+    local mode=$1
+    echo "Switching to $mode Mode..."
+
+    if [[ "$mode" == "Release" ]]; then
+        # 1. Properties: DuckDNS active
+        sed -i 's/^server.host=database.server.england/#server.host=database.server.england/' "$PROP_FILE"
+        sed -i 's/^#server.host=englandtechnologies.duckdns.org/server.host=englandtechnologies.duckdns.org/' "$PROP_FILE"
+
+        # 2. Java: DuckDNS active
+        for f in "${JAVA_FILES[@]}"; do
+            sed -i 's|^[[:space:]/]*private static final String SERVER_HOST = "englandtechnologies.duckdns.org"|  private static final String SERVER_HOST = "englandtechnologies.duckdns.org"|' "$f"
+            sed -i 's|^[[:space:]/]*private static final String SERVER_HOST = "search.server.england"|//  private static final String SERVER_HOST = "search.server.england"|' "$f"
+        done
+    else
+        # 1. Properties: Local active
+        sed -i 's/^server.host=englandtechnologies.duckdns.org/#server.host=englandtechnologies.duckdns.org/' "$PROP_FILE"
+        sed -i 's/^#server.host=database.server.england/server.host=database.server.england/' "$PROP_FILE"
+
+        # 2. Java: Local active
+        for f in "${JAVA_FILES[@]}"; do
+            sed -i 's|^[[:space:]/]*private static final String SERVER_HOST = "search.server.england"|  private static final String SERVER_HOST = "search.server.england"|' "$f"
+            sed -i 's|^[[:space:]/]*private static final String SERVER_HOST = "englandtechnologies.duckdns.org"|//  private static final String SERVER_HOST = "englandtechnologies.duckdns.org"|' "$f"
+        done
+    fi
+
+    echo -e "\n[DONE] Switched to $mode Mode."
+    # Verification check - HeartbeatTrigger is excluded here
+    grep -E "^server.host|^#server.host|SERVER_HOST =" "$PROP_FILE" "${JAVA_FILES[@]}"
+}
+
+# Parameter check
+[[ "$1" == "1" ]] && apply_mode "Release" && exit 0
+[[ "$1" == "2" ]] && apply_mode "Developer"

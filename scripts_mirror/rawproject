@@ -1,157 +1,413 @@
 #!/bin/bash
-# rawproject (server): manage per-project "Raw" datasets with short snapshot retention
+# rawproject (client, runs on traes-pc)
 # Usage:
-#   sudo rawproject create "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
-#   sudo rawproject preview "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
-#   sudo rawproject finish [--yes] "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
+#   rawproject create "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
+#   rawproject finish "/mnt/MainStorage/Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
 #   rawproject list
+#
+#   Inside /mnt/MainStorage, relative paths are relative to the current directory:
+#   cd "/mnt/MainStorage/Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8"
+#   rawproject create Mission7-8     (creates .../AceCombat8/Mission7-8/Raw)
+#   rawproject finish Mission7-8
+#
+#   Local disk mode (btrfs subvolume + snapper snapshots, no file server involved):
+#   rawproject create -ld ./AceCombat8/Mission3
+#   rawproject create --local_disk ~/Videos/Mission3
+#   rawproject finish -ld ~/Videos/Mission3
+#   rawproject list -ld
+#
+# Server paths can be absolute under /mnt/MainStorage, relative to the current
+# directory (when you are inside /mnt/MainStorage), or relative to the share
+# root (when you are anywhere else), so tab completion works.
+# Local paths can be relative to the pwd, absolute, or start with ~
+#
+# Optional environment variable for local mode:
+#   RAWPROJECT_SNAP_KEEP   number of snapshots to keep (default 72, so 6 hours at 5 min)
 set -euo pipefail
 
-POOL="storage"
-PARENT="${POOL}/raw"
-ROOT="/mnt/MergedStorage"
-OWNER="awesomeshot5051"
+SERVER="file.server.england"
+REMOTE_USER="rawproj"
+KEY="${HOME}/.ssh/rawproject_ed25519"
+CLIENT_ROOT="/mnt/MainStorage"
+
+# Local disk mode settings
+SNAP_INTERVAL="5min"
+SNAP_KEEP="${RAWPROJECT_SNAP_KEEP:-72}"
+CFG_PREFIX="rawproject_"
+UNIT_DIR="/etc/systemd/system"
+UNIT_NAME="rawproject-snap@"
 
 usage() {
-    echo "Usage: rawproject create|preview|finish [--yes] \"<project path relative to ${ROOT}>\""
+    echo "Usage: rawproject create|finish \"<project folder path>\""
     echo "       rawproject list"
+    echo "       rawproject create|finish -ld|--local_disk \"<local folder path>\""
+    echo "       rawproject list -ld"
     exit 1
 }
 
-slug() {
-    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_'
+remote() {
+    ssh -q -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        "${REMOTE_USER}@${SERVER}" "$1"
 }
 
-clean_path() {
-    local p="${1#/}"
-    p="${p%/}"
-    if [[ -z "$p" || "$p" == *..* || "$p" =~ [[:cntrl:]] ]]; then
-        echo "Invalid project path." >&2
+# Turns whatever the user typed into a path relative to the share root.
+#   absolute path           -> must be under CLIENT_ROOT
+#   relative, pwd in share  -> resolved against the current directory
+#   relative, pwd elsewhere -> resolved against CLIENT_ROOT
+normalize_path() {
+    local p="$1" abs root
+    if [[ -z "$p" ]]; then
+        echo "Give the project folder path." >&2
         exit 1
     fi
-    local real
-    real="$(realpath -m "${ROOT}/${p}")"
-    if [[ "$real" != "${ROOT}/"* ]]; then
-        echo "Path resolves outside ${ROOT}." >&2
+
+    root="$(realpath -sm -- "$CLIENT_ROOT")"
+
+    if [[ "$p" == /* ]]; then
+        abs="$p"
+    elif [[ "$PWD" == "$root" || "$PWD" == "$root"/* ]]; then
+        abs="${PWD}/${p}"
+    else
+        abs="${root}/${p}"
+    fi
+
+    # -s: do not resolve symlinks, -m: path does not need to exist yet
+    abs="$(realpath -sm -- "$abs")"
+
+    if [[ "$abs" != "$root" && "$abs" != "$root"/* ]]; then
+        echo "Path is outside ${root}: ${abs}" >&2
+        exit 1
+    fi
+
+    p="${abs#"$root"}"
+    p="${p#/}"
+    p="${p%/}"
+    p="${p%/Raw}"
+    if [[ -z "$p" ]]; then
+        echo "Give the project folder path." >&2
         exit 1
     fi
     printf '%s' "$p"
 }
 
-ensure_parent() {
-    if ! zfs list -H -o name "$PARENT" >/dev/null 2>&1; then
-        zfs create -o canmount=off -o mountpoint=none \
-            -o recordsize=1M -o compression=lz4 -o atime=off "$PARENT"
-        echo "Created container dataset ${PARENT}"
+# ---------------------------------------------------------------------------
+# Local disk helpers
+# ---------------------------------------------------------------------------
+
+require_local_tools() {
+    local tool
+    for tool in snapper btrfs systemctl; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "Missing required tool: ${tool}" >&2
+            exit 1
+        fi
+    done
+}
+
+# Expand ~, make absolute relative to the pwd, resolve symlinks and ./..
+local_abs_path() {
+    local p="$1"
+    if [[ -z "$p" ]]; then
+        echo "Give the local folder path." >&2
+        exit 1
+    fi
+    p="${p/#\~/$HOME}"
+    realpath -m -- "$p"
+}
+
+# Stable snapper config name derived from the absolute path
+local_cfg_name() {
+    local hash
+    hash="$(printf '%s' "$1" | sha1sum | cut -c1-10)"
+    printf '%s%s' "$CFG_PREFIX" "$hash"
+}
+
+# Prints the subvolume a snapper config manages (empty if config does not exist)
+cfg_subvolume() {
+    sudo snapper -c "$1" get-config 2>/dev/null | awk -F'|' '
+        { k = $1; gsub(/^ +| +$/, "", k) }
+        k == "SUBVOLUME" { v = $2; gsub(/^ +| +$/, "", v); print v }
+    ' || true
+}
+
+# Prints snapshot numbers (excluding 0, the "current" pseudo snapshot)
+cfg_snapshot_numbers() {
+    sudo snapper -c "$1" --csvout list --columns number 2>/dev/null \
+        | grep -E '^[1-9][0-9]*$' || true
+}
+
+# Installs the systemd template service and timer if missing or changed
+install_snap_units() {
+    local snapper_bin changed=0 svc timer
+    snapper_bin="$(command -v snapper)"
+
+    svc="[Unit]
+Description=rawproject snapshot for snapper config %i
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=${snapper_bin} -c %i create -t single -c number -d rawproject
+ExecStartPost=${snapper_bin} -c %i cleanup number"
+
+    timer="[Unit]
+Description=rawproject snapshot timer for snapper config %i
+
+[Timer]
+OnActiveSec=${SNAP_INTERVAL}
+OnUnitActiveSec=${SNAP_INTERVAL}
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target"
+
+    write_unit() {
+        local file="$1" content="$2"
+        if [[ ! -f "$file" ]] || [[ "$(cat "$file")" != "$content" ]]; then
+            printf '%s\n' "$content" | sudo tee "$file" >/dev/null
+            changed=1
+        fi
+    }
+
+    write_unit "${UNIT_DIR}/${UNIT_NAME}.service" "$svc"
+    write_unit "${UNIT_DIR}/${UNIT_NAME}.timer" "$timer"
+
+    if [[ "$changed" -eq 1 ]]; then
+        sudo systemctl daemon-reload
     fi
 }
 
-# Pull out the --yes flag so it can appear anywhere
-YES=0
-ARGS=()
-for a in "$@"; do
-    if [[ "$a" == "--yes" ]]; then
-        YES=1
-    else
-        ARGS+=("$a")
+local_create() {
+    local abs parent cfg fstype
+    require_local_tools
+    abs="$(local_abs_path "$1")"
+    cfg="$(local_cfg_name "$abs")"
+    parent="$(dirname "$abs")"
+
+    if [[ -e "$abs" ]]; then
+        echo "Already exists: ${abs}" >&2
+        exit 1
     fi
+
+    mkdir -p -- "$parent"
+    fstype="$(stat -f -c %T -- "$parent")"
+    if [[ "$fstype" != "btrfs" ]]; then
+        echo "${parent} is on '${fstype}', not btrfs. Local snapshots need btrfs." >&2
+        exit 1
+    fi
+
+    sudo -v
+    install_snap_units
+
+    echo "Creating btrfs subvolume ${abs}"
+    sudo btrfs subvolume create -- "$abs" >/dev/null
+    sudo chown "$(id -u):$(id -g)" -- "$abs"
+
+    echo "Creating snapper config ${cfg}"
+    if ! sudo snapper -c "$cfg" create-config -- "$abs"; then
+        echo "snapper create-config failed, removing the subvolume again." >&2
+        sudo btrfs subvolume delete -- "$abs" >/dev/null || true
+        exit 1
+    fi
+
+    # Disable hourly timeline snapshots, use our own fast timer with a count limit
+    sudo snapper -c "$cfg" set-config \
+        TIMELINE_CREATE=no \
+        TIMELINE_CLEANUP=no \
+        NUMBER_CLEANUP=yes \
+        NUMBER_MIN_AGE=0 \
+        NUMBER_LIMIT="$SNAP_KEEP" \
+        NUMBER_LIMIT_IMPORTANT="$SNAP_KEEP" \
+        EMPTY_PRE_POST_CLEANUP=no
+
+    # First snapshot right away, then start the recurring timer
+    sudo snapper -c "$cfg" create -t single -c number -d rawproject
+    sudo systemctl enable --now "${UNIT_NAME}${cfg}.timer" >/dev/null 2>&1
+
+    echo "Ready: ${abs}"
+    echo "Snapshots every ${SNAP_INTERVAL}, keeping the newest ${SNAP_KEEP} (config ${cfg})."
+}
+
+local_finish() {
+    local abs cfg sub project_name answer count size
+    local -a nums
+    require_local_tools
+    abs="$(local_abs_path "$1")"
+    cfg="$(local_cfg_name "$abs")"
+    project_name="$(basename "$abs")"
+
+    sudo -v
+
+    sub="$(cfg_subvolume "$cfg")"
+    if [[ -z "$sub" || "$sub" != "$abs" ]]; then
+        echo "${abs} is not a rawproject local folder (no matching snapper config)." >&2
+        echo "Refusing to delete it." >&2
+        exit 1
+    fi
+    if ! sudo btrfs subvolume show -- "$abs" >/dev/null 2>&1; then
+        echo "${abs} is not a btrfs subvolume. Refusing to delete it." >&2
+        exit 1
+    fi
+
+    mapfile -t nums < <(cfg_snapshot_numbers "$cfg")
+    count="${#nums[@]}"
+    size="$(du -sh --exclude=.snapshots -- "$abs" 2>/dev/null | cut -f1 || true)"
+
+    echo "Local project: ${abs}"
+    echo "Data size:     ${size:-unknown}"
+    echo "Snapshots:     ${count}"
+    echo "This permanently deletes the folder, all its snapshots, and the snapper config."
+    echo
+    read -r -p "Type the project folder name (${project_name}) to confirm: " answer
+    if [[ "$answer" != "$project_name" ]]; then
+        echo "Cancelled."
+        exit 1
+    fi
+
+    # Make sure nothing has files open in there (includes a shell sitting inside it)
+    if command -v lsof >/dev/null 2>&1; then
+        if sudo lsof -w +D "$abs" >/dev/null 2>&1; then
+            echo "Something is still using ${abs}:" >&2
+            sudo lsof -w +D "$abs" 2>/dev/null | head -n 15 >&2 || true
+            echo "Close it (DaVinci, file manager, any terminal inside that folder) and rerun." >&2
+            exit 1
+        fi
+    else
+        echo "Note: lsof not installed, skipping the in-use check." >&2
+    fi
+
+    echo "Stopping snapshot timer"
+    sudo systemctl disable --now "${UNIT_NAME}${cfg}.timer" >/dev/null 2>&1 || true
+    sudo systemctl stop "${UNIT_NAME}${cfg}.service" >/dev/null 2>&1 || true
+
+    if [[ "$count" -gt 0 ]]; then
+        echo "Deleting ${count} snapshots"
+        sudo snapper -c "$cfg" delete --sync "${nums[@]}"
+    fi
+
+    echo "Removing snapper config"
+    if ! sudo snapper -c "$cfg" delete-config; then
+        echo "delete-config failed, removing the config by hand." >&2
+        sudo btrfs subvolume delete -- "${abs}/.snapshots" >/dev/null 2>&1 || true
+        sudo snapper -c "$cfg" delete-config || true
+    fi
+
+    echo "Deleting subvolume ${abs}"
+    sudo btrfs subvolume delete -c -- "$abs"
+
+    if [[ -e "$abs" ]]; then
+        echo "Warning: ${abs} still exists. Check it manually." >&2
+        exit 1
+    fi
+    echo "Removed ${abs}"
+}
+
+local_list() {
+    require_local_tools
+    sudo snapper --csvout list-configs --columns config,subvolume 2>/dev/null | awk -v pre="$CFG_PREFIX" '
+        NR > 1 && index($1, pre) == 1 {
+            cfg = $1
+            sub(/^[^,]*,/, "")
+            print cfg "  " $0
+            found = 1
+        }
+        END { if (!found) print "No local rawproject folders." }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+LOCAL=0
+args=()
+for a in "$@"; do
+    case "$a" in
+        -ld|--local_disk) LOCAL=1 ;;
+        -h|--help) usage ;;
+        *) args+=("$a") ;;
+    esac
 done
-set -- ${ARGS[@]+"${ARGS[@]}"}
+set -- "${args[@]+"${args[@]}"}"
 
 cmd="${1:-}"
 case "$cmd" in
     list)
-        zfs list -r -o name,used,refer,mountpoint "$PARENT"
+        if [[ "$LOCAL" -eq 1 ]]; then
+            local_list
+        else
+            remote "list"
+        fi
         ;;
 
     create)
         [[ $# -eq 2 ]] || usage
-        [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
-        rel="$(clean_path "$2")"
-        name="$(slug "$rel")"
-        ds="${PARENT}/${name}"
-        mp="${ROOT}/${rel}/Raw"
 
-        if zfs list -H -o name "$ds" >/dev/null 2>&1; then
-            echo "Dataset ${ds} already exists." >&2
-            exit 1
-        fi
-        if [[ -d "$mp" && -n "$(ls -A "$mp")" ]]; then
-            echo "${mp} exists and is not empty. Move or rename it first." >&2
-            exit 1
+        if [[ "$LOCAL" -eq 1 ]]; then
+            local_create "$2"
+            exit 0
         fi
 
-        ensure_parent
-        mkdir -p "${ROOT}/${rel}"
-        zfs create -o mountpoint="$mp" "$ds"
-        chown "${OWNER}:${OWNER}" "$mp"
-        chmod 775 "$mp"
-        echo "Created ${ds} mounted at ${mp}"
-        ;;
+        rel="$(normalize_path "$2")"
+        b64="$(printf '%s' "$rel" | base64 -w0)"
+        mp="${CLIENT_ROOT}/${rel}/Raw"
 
-    preview)
-        [[ $# -eq 2 ]] || usage
-        [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
-        rel="$(clean_path "$2")"
-        name="$(slug "$rel")"
-        ds="${PARENT}/${name}"
+        remote "create ${b64}"
 
-        if ! zfs list -H -o name "$ds" >/dev/null 2>&1; then
-            echo "Dataset ${ds} does not exist." >&2
-            exit 1
+        ls "${CLIENT_ROOT}/${rel}" >/dev/null 2>&1 || true
+        for _ in 1 2 3 4 5; do
+            [[ -d "$mp" ]] && break
+            sleep 1
+        done
+        if [[ -d "$mp" ]]; then
+            echo "Ready: ${mp}"
+        else
+            echo "Created on the server, but ${mp} is not visible here yet."
+            echo "Run: ls \"${CLIENT_ROOT}/${rel}\"  (or remount ${CLIENT_ROOT})"
         fi
-        echo "This would permanently destroy ${ds} and all of its snapshots:"
-        zfs destroy -rnv "$ds"
         ;;
 
     finish)
         [[ $# -eq 2 ]] || usage
-        [[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
-        rel="$(clean_path "$2")"
-        name="$(slug "$rel")"
-        ds="${PARENT}/${name}"
-        mp="${ROOT}/${rel}/Raw"
 
-        if ! zfs list -H -o name "$ds" >/dev/null 2>&1; then
-            echo "Dataset ${ds} does not exist." >&2
+        if [[ "$LOCAL" -eq 1 ]]; then
+            local_finish "$2"
+            exit 0
+        fi
+
+        rel="$(normalize_path "$2")"
+        b64="$(printf '%s' "$rel" | base64 -w0)"
+        mp="${CLIENT_ROOT}/${rel}/Raw"
+        project_name="$(basename "$rel")"
+
+        # Dry run from the server (exits nonzero if the dataset does not exist)
+        remote "preview ${b64}"
+        echo
+        read -r -p "Type the project folder name (${project_name}) to confirm: " answer
+        if [[ "$answer" != "$project_name" ]]; then
+            echo "Cancelled."
             exit 1
         fi
 
-        if [[ $YES -ne 1 ]]; then
-            echo "This will permanently destroy ${ds} and all of its snapshots:"
-            zfs destroy -rnv "$ds"
-            echo
-            read -r -p "Type the dataset name to confirm (${name}): " answer
-            if [[ "$answer" != "$name" ]]; then
-                echo "Cancelled."
+        # Release the nested NFS mount on this machine before the server destroys it
+        if findmnt -rn -M "$mp" >/dev/null 2>&1; then
+            # Plain fuser -m prints only real process IDs, not the mount itself
+            pids="$(sudo fuser -m "$mp" 2>/dev/null || true)"
+            if [[ -n "${pids//[[:space:]]/}" ]]; then
+                echo "Something is still using ${mp}:" >&2
+                sudo fuser -vm "$mp" 2>&1 | grep -v 'kernel mount' >&2 || true
+                echo "Close it (DaVinci, file manager, any terminal inside that folder) and rerun." >&2
                 exit 1
             fi
-        fi
-
-        # NFS clients and nfsd can pin the mount, so flush the export cache
-        # first and retry a few times before giving up.
-        errfile="$(mktemp)"
-        trap 'rm -f "$errfile"' EXIT
-        destroyed=0
-        for attempt in 1 2 3 4 5; do
-            exportfs -f 2>/dev/null || true
-            if zfs destroy -r "$ds" 2>"$errfile"; then
-                destroyed=1
-                break
+            if ! sudo umount "$mp"; then
+                echo "Could not unmount ${mp}. Close anything viewing that folder and rerun." >&2
+                exit 1
             fi
-            echo "Attempt ${attempt} failed: $(cat "$errfile")"
-            sleep 3
-        done
-
-        if [[ $destroyed -ne 1 ]]; then
-            echo "Dataset is still busy. Current holders of ${mp}:" >&2
-            fuser -vm "$mp" 2>&1 || true
-            echo "If a client still has it mounted, unmount the nested path there first." >&2
-            exit 1
+            echo "Unmounted ${mp}"
         fi
 
-        rmdir "$mp" 2>/dev/null || true
-        echo "Destroyed ${ds}. Space is free immediately."
+        remote "finish ${b64} yes"
         ;;
 
     *)

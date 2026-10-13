@@ -1,0 +1,46 @@
+#!/usr/bin/env zsh
+# topgrade-weekly.sh
+# Prompts once per Saturday to run `topgrade`: dry-run first, then the real run.
+#
+# Install:
+#   1. Save this file somewhere permanent, e.g. ~/.config/topgrade-weekly.sh
+#   2. Add this line near the bottom of ~/.zshrc:
+#        source ~/.config/topgrade-weekly.sh
+
+TOPGRADE_MARKER="$HOME/.cache/topgrade-last-prompt"
+mkdir -p "${TOPGRADE_MARKER:h}"
+
+# %u = ISO day of week, 6 = Saturday
+if [[ "$(date +%u)" -eq 6 ]]; then
+  TODAY="$(date +%F)"
+  LAST_RUN=""
+  [[ -f "$TOPGRADE_MARKER" ]] && LAST_RUN="$(cat "$TOPGRADE_MARKER")"
+
+  if [[ "$LAST_RUN" != "$TODAY" ]]; then
+    # Mark as prompted for today first, so a "no" or a Ctrl-C doesn't
+    # cause it to nag again in every new shell you open today.
+    echo "$TODAY" > "$TOPGRADE_MARKER"
+
+    echo ""
+    echo "It's Saturday — time for your weekly topgrade run."
+    read "RUN_IT?Run topgrade now? [y/N] "
+    if [[ "$RUN_IT" =~ ^[Yy]$ ]]; then
+      echo ""
+      echo "── Dry run ──────────────────────────────────────"
+      topgrade --dry-run
+
+      echo ""
+      read "DO_REAL?Dry run complete. Proceed with the real run? [y/N] "
+      if [[ "$DO_REAL" =~ ^[Yy]$ ]]; then
+        echo ""
+        echo "── Real run ─────────────────────────────────────"
+        topgrade
+      else
+        echo "Skipped the real run."
+      fi
+    else
+      echo "Skipped for today."
+    fi
+    echo ""
+  fi
+fi

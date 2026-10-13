@@ -1,0 +1,21 @@
+#!/bin/bash
+STATE_FILE="/tmp/.kscreen-autoswitch-state"
+
+real_connected=$(xrandr --query | grep -cE "^(DP-0|DP-2|DP-4) connected")
+
+if [ "$real_connected" -ge 1 ]; then
+  new_state="local"
+else
+  new_state="remote"
+fi
+
+last_state=$(cat "$STATE_FILE" 2>/dev/null)
+
+if [ "$new_state" != "$last_state" ]; then
+  if [ "$new_state" = "local" ]; then
+    kscreen-doctor output.HDMI-0.disable
+  else
+    kscreen-doctor output.HDMI-0.enable output.HDMI-0.primary
+  fi
+  echo "$new_state" > "$STATE_FILE"
+fi
