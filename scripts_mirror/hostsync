@@ -1,0 +1,1198 @@
+#!/usr/bin/env bash
+# hostsync - rsync wrapper for home lab / multi-host syncing
+# Usage: hostsync [OPTIONS] <file(s)...> -o <remote_path>
+#        hostsync [OPTIONS] -d <directory> -o <remote_path>
+#
+# Requires bash 4.4+, rsync (local and remote), ssh. sshpass is needed only for
+# password logins. --mkpath needs rsync 3.2.3+ on both ends.
+# Domain discovery (-D) additionally uses getent, timeout, xargs and awk.
+# dig is needed for --dns-server, --axfr-server and DNS server auto-detection.
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────
+# Defaults
+# ─────────────────────────────────────────────
+SSH_KEY=""
+LOGIN_PASSWORD="${HOSTSYNC_PASSWORD:-}"   # SSH login / sudo password (env var preferred over -p)
+PASSWORD_FROM_CLI=false
+REMOTE_USER="${USER:-$(id -un)}"
+HOSTS=()
+AUTO_DISCOVER=false
+ENV_HOSTS=false
+DIRECTORY_MODE=false
+SOURCE_DIR=""
+SOURCES=()
+REMOTE_PATH=""
+VERBOSE=false
+USE_SUDO=false
+ASSUME_YES=false
+MAX_PARALLEL=8
+CONNECT_TIMEOUT=5
+PARALLEL=true
+DRY_RUN=false
+DELETE=false
+LIST_ONLY=false
+
+# Domain discovery and exclusions
+DOMAINS=()
+SUBNETS=()
+AXFR_SERVER=""
+DNS_SERVER=""   # DNS server queried directly for PTR/A lookups (empty = system resolver)
+EXCLUDES=()
+EXCLUDE_PATS=()
+LOCAL_IPS=()
+SWEEP_SUBNETS=()
+SWEEP_IPS=()
+DNS_JOBS=32     # parallel reverse lookups during a domain sweep
+MIN_PREFIX=22   # smallest allowed subnet prefix for a sweep (/22 = 1022 hosts)
+
+LOG_DIR="${HOME}/.synchosts"
+LOG_FILE="${LOG_DIR}/hostsync.log"
+
+# Environment variable name hostsync will read hosts from
+HOSTSYNC_ENV_VAR="HOSTSYNC_HOSTS"
+
+# Runtime state (filled in later)
+AUTH_PREFIX=()
+SSH_OPTS=()
+RSYNC_OPTS=()
+DELETE_OPT=()
+RSH_CMD=""
+STATUS_DIR=""
+_AGENT_PID=""
+
+# ─────────────────────────────────────────────
+# Colours (stdout only, stripped from log file)
+# ─────────────────────────────────────────────
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+# ─────────────────────────────────────────────
+# Logging helpers
+# ─────────────────────────────────────────────
+ensure_log() {
+    if [[ ! -d "${LOG_DIR}" ]]; then
+        mkdir -p "${LOG_DIR}"
+        chmod 700 "${LOG_DIR}"
+    fi
+    if [[ ! -f "${LOG_FILE}" ]]; then
+        : > "${LOG_FILE}"
+        chmod 600 "${LOG_FILE}"
+    fi
+}
+
+# Write a plain (no-colour) line to the log file
+log_file() {
+    ensure_log
+    printf '%s\n' "$*" | strip_ansi >> "${LOG_FILE}"
+}
+
+# Print to stdout (always) and log without colour codes
+emit() {
+    echo -e "$*"
+    local clean_msg
+    clean_msg=$(echo -e "$*")
+    log_file "[$(date '+%Y-%m-%d %H:%M:%S')] ${clean_msg}"
+}
+
+# Only reaches the terminal with -v, always logged.
+# NOTE: written with if/fi on purpose. A trailing '$VERBOSE && echo' returns 1
+# when VERBOSE=false, and under 'set -e' that aborts the caller.
+vlog() {
+    local clean_msg
+    clean_msg=$(echo -e "$*")
+    log_file "[$(date '+%Y-%m-%d %H:%M:%S')] ${clean_msg}"
+    if $VERBOSE; then
+        echo -e "$*"
+    fi
+}
+
+log_info()    { emit "${CYAN}[hostsync]${RESET} $*"; }
+log_success() { emit "${GREEN}[  OK  ]${RESET} $*"; }
+log_warn()    { emit "${YELLOW}[ WARN ]${RESET} $*"; }
+log_err()     { emit "${RED}[ ERR  ]${RESET} $*" >&2; }
+log_verbose() { vlog "${CYAN}[hostsync]${RESET} $*"; }
+
+# ─────────────────────────────────────────────
+# Cleanup (runs on every exit path)
+# ─────────────────────────────────────────────
+cleanup() {
+    if [[ -n "${_AGENT_PID}" ]]; then
+        kill "${_AGENT_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${STATUS_DIR}" && -d "${STATUS_DIR}" ]]; then
+        rm -rf "${STATUS_DIR}"
+    fi
+    unset SSHPASS LOGIN_PASSWORD
+}
+trap cleanup EXIT
+trap 'echo; echo "hostsync: interrupted."; exit 130' INT TERM
+
+# ─────────────────────────────────────────────
+# Usage
+# ─────────────────────────────────────────────
+usage() {
+    ensure_log
+    echo -e "
+${BOLD}hostsync${RESET} - sync files/directories to one or more remote hosts via rsync
+
+${BOLD}USAGE${RESET}
+  hostsync [OPTIONS] <file(s)...> -o <remote_path>
+  hostsync [OPTIONS] -d <directory> -o <remote_path>
+  Use -- before file names that start with a dash.
+
+${BOLD}AUTH OPTIONS${RESET}
+  -k <path>       Path to SSH private key file. The key is loaded into a private,
+                  temporary ssh-agent (you are prompted for a passphrase if it
+                  has one) and the agent is killed on exit.
+                  With -s, the password (see below) is used only for sudo.
+  -p <password>   Login/sudo password. WARNING: visible in the process list and
+                  shell history. Prefer \$HOSTSYNC_PASSWORD or the interactive
+                  prompt. Password logins require sshpass.
+
+${BOLD}HOST OPTIONS${RESET}  (combinable, all collected hosts are merged and deduplicated)
+  -h <host|file>  Single IP/hostname on the CLI, OR a file containing exactly
+                  one IP/hostname (lines starting with # are ignored)
+  -H <list|file>  Semicolon-separated IPs/hostnames on the CLI, OR a file
+                  containing IPs/hostnames separated by semicolons and/or
+                  newlines (lines starting with # are ignored)
+  -e              Read hosts from the \$${HOSTSYNC_ENV_VAR} environment variable
+                  (semicolon-separated list, same format as -H)
+  -a              Auto-discover hosts via 'ip n show'  (see warning below)
+
+${BOLD}DOMAIN OPTIONS${RESET}
+  -D <domain>     Sync to every device whose reverse-DNS (PTR) name ends in this
+                  domain, e.g. -D england matches file.server.england. Can be
+                  repeated or semicolon-separated.
+                  DNS cannot list a zone on request, so hostsync sweeps the PTR
+                  records of the subnets below and keeps the matches. A match is
+                  used by name only if its forward lookup points back at the same
+                  IP, otherwise the IP is used and a warning is shown.
+                  This machine is skipped automatically.
+  --dns-server <ip|host>
+                  Ask this DNS server directly for the PTR/A lookups instead of
+                  the system resolver. Your system resolver may not serve reverse
+                  records for the whole zone. If omitted, hostsync tries to find
+                  the server from the domain's NS records (needs dig). Also used
+                  to match -x exclusions by IP or name.
+  --subnet <cidr> Subnet(s) to sweep for -D (semicolon-separated, repeatable).
+                  Default: the subnets of this machine's network interfaces
+                  (docker/virtual bridges and anything larger than /${MIN_PREFIX} skipped).
+  --axfr-server <ip|host>
+                  Try a DNS zone transfer (AXFR) from this server first. Only
+                  works if the server allows transfers from this machine.
+                  Falls back to the sweep. Needs dig.
+  -x <list|file>  Exclude hosts. Semicolon-separated names, IPs or glob patterns,
+                  or a file of them (one per line, # comments). Applies to every
+                  host source, and matches either the name or the IP of a host.
+                  Quote patterns so your shell does not expand the *.
+                  A pattern starting with a dot is a suffix match:
+                  '.printer.england' means '*.printer.england'.
+  --list-hosts    Resolve and print the final target hosts, then exit. Needs no
+                  files or -o, so it is a good way to preview -D and -x.
+
+${BOLD}OTHER OPTIONS${RESET}
+  -u <username>   Remote username  (default: current user)
+  -d <directory>  Sync a local directory instead of individual files
+  -o <path>       ${BOLD}Required.${RESET} Destination path on the remote host(s).
+                  Created automatically if it does not exist. Use an absolute
+                  path (a leading ~ is not expanded).
+  -s              Deploy with sudo on the remote host (for root-owned paths).
+                  Files are staged in a private temp dir, then copied into place
+                  with a single sudo rsync. The sudo password is sent over
+                  stdin, never placed on a command line.
+  -y              Skip the 'Proceed?' confirmation (for scripts and cron)
+  -v              Verbose: print all rsync output to stdout as well as the log
+  --mp <int>      Maximum number of parallel jobs (default 8)
+  --dry-run       Pass --dry-run to rsync (nothing is changed). With -s only the
+                  staging connection is tested and the deploy step is skipped.
+  --delete        Mirror mode: delete extra files in the destination.
+                  Only allowed together with -d.
+  --no-parallel   Sync hosts sequentially instead of in parallel
+  --help          Show this help
+
+${BOLD}LOGGING${RESET}
+  All activity is recorded to: ${LOG_FILE}
+
+${BOLD}EXIT STATUS${RESET}
+  0 if every host synced, 1 if any host failed.
+
+${BOLD}ENVIRONMENT${RESET}
+  HOSTSYNC_HOSTS      semicolon-separated hosts, used with -e
+  HOSTSYNC_PASSWORD   login/sudo password, safer than -p
+
+${BOLD}EXAMPLES${RESET}
+  # Single host, interactive password prompt
+  hostsync -u admin -h 192.168.1.10 app.conf -o /home/admin/myapp/
+
+  # Multiple hosts, SSH key, remote sudo deploy
+  hostsync -k ~/.ssh/id_ed25519 -s -H '192.168.1.10;192.168.1.20' -d ./configs -o /usr/local/bin/
+
+  # Everything in the .england domain, except the firewall and all printers
+  hostsync -k ~/.ssh/id_ed25519 -D england -x 'cisco.firewall.england;.printer.england' -d ./scripts -o /home/me/scripts/
+
+  # Same, naming the DNS server explicitly
+  hostsync -D england --dns-server 192.168.0.197 -x 'cisco.firewall.england' --list-hosts
+
+  # Hosts from file + environment variable, verbose
+  hostsync -H ~/lab_hosts -e -v -d ./scripts -o /home/pi/scripts/
+
+  # Auto-discover
+  hostsync -a -u pi -d ./dotfiles -o /home/pi/dotfiles/
+
+${BOLD}AUTO-DISCOVER WARNING${RESET}
+  -a queries the kernel ARP/NDP neighbour table ('ip n show') and will attempt
+  to contact EVERY IP in the cache: routers, printers, IoT devices, etc.
+  You will be asked to confirm before any transfer begins."
+}
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+need_arg() {
+    # usage: need_arg "$@"   ($1 is the option, $2 must exist)
+    if [[ $# -lt 2 ]]; then
+        log_err "Option $1 requires an argument."
+        exit 1
+    fi
+}
+
+valid_host() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; }
+valid_user() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; }
+
+# rsync needs IPv6 literals in brackets
+rsync_host() {
+    if [[ "$1" == *:* ]]; then
+        printf '[%s]' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Prints the items of a semicolon-separated list, one per line.
+# With allow_file=yes (default), an argument that is an existing file is read
+# instead (items separated by semicolons and/or newlines, # starts a comment).
+parse_list_input() {
+    local input="$1" allow_file="${2:-yes}"
+    local -a lines=() parts=()
+    local raw_line h
+
+    if [[ "$allow_file" == "yes" && -f "$input" ]]; then
+        while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+            raw_line="${raw_line%%#*}"
+            IFS=';' read -ra parts <<< "$raw_line" || true
+            if [[ ${#parts[@]} -gt 0 ]]; then
+                lines+=("${parts[@]}")
+            fi
+        done < "$input"
+    else
+        IFS=';' read -ra lines <<< "$input" || true
+    fi
+
+    if [[ ${#lines[@]} -gt 0 ]]; then
+        for h in "${lines[@]}"; do
+            h="$(echo "$h" | tr -d '[:space:]')"
+            if [[ -n "$h" ]]; then
+                printf '%s\n' "$h"
+            fi
+        done
+    fi
+}
+
+# Runs a command, logging its output (and showing it with -v).
+# Returns the command's own exit status.
+run_logged() {
+    local label="$1"; shift
+    local rc=0 out=""
+    if $VERBOSE; then
+        set +e
+        "$@" 2>&1 | tee -a "${LOG_FILE}"
+        rc=${PIPESTATUS[0]}
+        set -e
+    else
+        out=$("$@" 2>&1) || rc=$?
+        if [[ -n "$out" ]]; then
+            log_file "[${label}] output:"$'\n'"${out}"
+        fi
+    fi
+    return "$rc"
+}
+
+# Best-effort removal of the remote staging directory
+remote_cleanup() {
+    local ssh_target="$1" staging="$2" q
+    printf -v q '%q' "$staging"
+    "${AUTH_PREFIX[@]}" ssh "${SSH_OPTS[@]}" "$ssh_target" "rm -rf -- ${q}" >/dev/null 2>&1 || true
+}
+
+host_in_list() {
+    local want="$1" h
+    if [[ ${#HOSTS[@]} -gt 0 ]]; then
+        for h in "${HOSTS[@]}"; do
+            if [[ "$h" == "$want" ]]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+# ─────────────────────────────────────────────
+# Subnet math (pure bash)
+# ─────────────────────────────────────────────
+ip_to_int() {
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    echo $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+
+int_to_ip() {
+    local n="$1"
+    echo "$(( (n >> 24) & 255 )).$(( (n >> 16) & 255 )).$(( (n >> 8) & 255 )).$(( n & 255 ))"
+}
+
+# Prints every usable host address in a CIDR block.
+# Returns 1 for an invalid CIDR, 2 if the block is larger than /MIN_PREFIX.
+expand_cidr() {
+    local cidr="$1" o prefix mask net bcast start end n
+    local -a octs=()
+    if ! [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
+        return 1
+    fi
+    octs=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
+    prefix=$((10#${BASH_REMATCH[5]}))
+    for o in "${octs[@]}"; do
+        if (( 10#$o > 255 )); then
+            return 1
+        fi
+    done
+    if (( prefix > 32 )); then
+        return 1
+    fi
+    if (( prefix < MIN_PREFIX )); then
+        return 2
+    fi
+
+    n=$(ip_to_int "${octs[0]}.${octs[1]}.${octs[2]}.${octs[3]}")
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    net=$(( n & mask ))
+    bcast=$(( net | (~mask & 0xFFFFFFFF) ))
+    if (( prefix >= 31 )); then
+        start=$net
+        end=$bcast
+    else
+        start=$(( net + 1 ))
+        end=$(( bcast - 1 ))
+    fi
+    for ((n = start; n <= end; n++)); do
+        int_to_ip "$n"
+    done
+}
+
+# ─────────────────────────────────────────────
+# DNS lookups
+# ─────────────────────────────────────────────
+
+# Reverse lookup. Prints lowercase names (no trailing dot), one per line.
+# With a server argument the server is queried directly using dig, otherwise
+# the system resolver is used.
+dns_ptr() {
+    local ip="$1" server="${2:-}"
+    if [[ -n "$server" ]]; then
+        dig @"$server" +short +time=2 +tries=1 -x "$ip" 2>/dev/null \
+            | awk '!/^;/ && NF { n = tolower($1); sub(/\.$/, "", n); print n }'
+    else
+        timeout 3 getent hosts "$ip" 2>/dev/null \
+            | awk '{ for (i = 2; i <= NF; i++) { n = tolower($i); sub(/\.$/, "", n); print n } }'
+    fi
+    return 0
+}
+
+# Forward lookup. Prints IPv4 addresses, one per line.
+dns_a() {
+    local name="$1" server="${2:-}"
+    if [[ -n "$server" ]]; then
+        dig @"$server" +short +time=2 +tries=1 A "$name" 2>/dev/null \
+            | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/'
+    else
+        timeout 3 getent ahostsv4 "$name" 2>/dev/null | awk '{ print $1 }' | sort -u
+    fi
+    return 0
+}
+
+# Finds the DNS server for a domain from its NS record. Prints an IPv4 address
+# or nothing. Uses the system resolver for these two lookups.
+detect_dns_server() {
+    local dom="$1" ns ip=""
+    ns=$(dig +short +time=2 +tries=1 NS "$dom" 2>/dev/null | awk '!/^;/ && NF { print $1; exit }')
+    ns="${ns%.}"
+    if [[ -z "$ns" ]]; then
+        return 0
+    fi
+    if [[ "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip="$ns"
+    else
+        ip=$(dig +short +time=2 +tries=1 A "$ns" 2>/dev/null | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')
+    fi
+    printf '%s' "$ip"
+    return 0
+}
+
+# Reverse-resolves one IP. If its name ends in one of the domains (space
+# separated list in $2), prints "ip<TAB>name<TAB>ok|mismatch", where ok means
+# the name also resolves forward to the same IP. $3 is the optional DNS server.
+# Runs in xargs workers.
+resolve_one() {
+    local ip="$1" doms="$2" server="${3:-}" name d match=0 status="mismatch"
+    name=$(dns_ptr "$ip" "$server" | head -n1)
+    if [[ -z "$name" ]]; then
+        return 0
+    fi
+    for d in $doms; do
+        if [[ "$name" == *."$d" ]]; then
+            match=1
+            break
+        fi
+    done
+    if (( match == 0 )); then
+        return 0
+    fi
+    if dns_a "$name" "$server" | grep -qxF "$ip"; then
+        status="ok"
+    fi
+    printf '%s\t%s\t%s\n' "$ip" "$name" "$status"
+}
+export -f dns_ptr dns_a resolve_one
+
+# Attempts a zone transfer. Prints "ip<TAB>name<TAB>ok" per A record.
+axfr_rows() {
+    local domain="$1" server="$2"
+    dig +noall +answer +time=3 +tries=1 AXFR "$domain" "@${server}" 2>/dev/null \
+        | awk '$4 == "A" { n = tolower($1); sub(/\.$/, "", n); print $5 "\t" n "\tok" }' || true
+}
+
+load_local_ips() {
+    LOCAL_IPS=()
+    if command -v ip &>/dev/null; then
+        mapfile -t LOCAL_IPS < <(ip -4 -o addr show 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }')
+    fi
+}
+
+is_local_ip() {
+    local want="$1" l
+    if [[ ${#LOCAL_IPS[@]} -gt 0 ]]; then
+        for l in "${LOCAL_IPS[@]}"; do
+            if [[ "$l" == "$want" ]]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+# ─────────────────────────────────────────────
+# Domain discovery
+# ─────────────────────────────────────────────
+
+# Fills SWEEP_SUBNETS from --subnet, or from this machine's interfaces.
+resolve_subnets() {
+    local c ifc cidr rc
+    SWEEP_SUBNETS=()
+
+    if [[ ${#SUBNETS[@]} -gt 0 ]]; then
+        for c in "${SUBNETS[@]}"; do
+            rc=0
+            expand_cidr "$c" > /dev/null || rc=$?
+            case "$rc" in
+                0) SWEEP_SUBNETS+=("$c") ;;
+                1) log_err "Invalid subnet: '$c' (expected something like 192.168.1.0/24)"; exit 1 ;;
+                2) log_err "Subnet '$c' is larger than /${MIN_PREFIX}. Split it into smaller --subnet blocks."; exit 1 ;;
+            esac
+        done
+        return 0
+    fi
+
+    if ! command -v ip &>/dev/null; then
+        log_err "The 'ip' command is not available. Pass the networks to sweep with --subnet."
+        exit 1
+    fi
+
+    while read -r ifc cidr; do
+        case "$ifc" in
+            docker*|br-*|veth*|virbr*|cni*|flannel*) continue ;;
+        esac
+        rc=0
+        expand_cidr "$cidr" > /dev/null || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            SWEEP_SUBNETS+=("$cidr")
+        elif [[ $rc -eq 2 ]]; then
+            log_verbose "Skipping ${cidr} on ${ifc}: larger than /${MIN_PREFIX}"
+        fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{ print $2, $4 }')
+
+    if [[ ${#SWEEP_SUBNETS[@]} -eq 0 ]]; then
+        log_err "No usable local subnet found for the sweep. Pass the networks with --subnet."
+        exit 1
+    fi
+}
+
+# Adds every host found in the requested domains to HOSTS.
+discover_domains() {
+    local d dom ip name status target c tool added=0 skipped_self=0
+    local -a norm=() sweep_doms=() rows=() hits=()
+
+    for tool in getent timeout xargs awk; do
+        if ! command -v "$tool" &>/dev/null; then
+            log_err "Domain discovery needs '$tool', which was not found."
+            exit 1
+        fi
+    done
+
+    for d in "${DOMAINS[@]}"; do
+        dom="${d,,}"
+        dom="${dom#.}"
+        dom="${dom%.}"
+        if ! [[ "$dom" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+            log_err "Invalid domain: '$d'"
+            exit 1
+        fi
+        norm+=("$dom")
+    done
+
+    load_local_ips
+
+    # 1) Optional zone transfer
+    if [[ -n "$AXFR_SERVER" ]]; then
+        if ! command -v dig &>/dev/null; then
+            log_err "--axfr-server needs dig, which was not found."
+            exit 1
+        fi
+        for dom in "${norm[@]}"; do
+            mapfile -t hits < <(axfr_rows "$dom" "$AXFR_SERVER")
+            if [[ ${#hits[@]} -gt 0 ]]; then
+                log_info "Zone transfer for ${dom}: ${#hits[@]} record(s) from ${AXFR_SERVER}"
+                rows+=("${hits[@]}")
+            else
+                log_warn "Zone transfer for ${dom} was refused or empty, falling back to a reverse-DNS sweep"
+                sweep_doms+=("$dom")
+            fi
+        done
+    else
+        sweep_doms=("${norm[@]}")
+    fi
+
+    # 2) Reverse-DNS sweep
+    if [[ ${#sweep_doms[@]} -gt 0 ]]; then
+        # Pick the DNS server: explicit, else from the domain's NS record, else system resolver
+        if [[ -z "$DNS_SERVER" ]] && command -v dig &>/dev/null; then
+            for dom in "${sweep_doms[@]}"; do
+                DNS_SERVER="$(detect_dns_server "$dom")"
+                if [[ -n "$DNS_SERVER" ]]; then
+                    log_info "Using DNS server ${DNS_SERVER} (from the NS record of ${dom}) for lookups"
+                    break
+                fi
+            done
+        fi
+        if [[ -z "$DNS_SERVER" ]]; then
+            log_info "Lookups use the system resolver. If hosts are missing, pass --dns-server <your DNS server>."
+        fi
+
+        resolve_subnets
+        mapfile -t SWEEP_IPS < <(
+            for c in "${SWEEP_SUBNETS[@]}"; do
+                expand_cidr "$c"
+            done | sort -uV
+        )
+        if [[ ${#SWEEP_IPS[@]} -gt 0 ]]; then
+            log_info "Sweeping ${#SWEEP_IPS[@]} address(es) in ${SWEEP_SUBNETS[*]} for names under: ${sweep_doms[*]}"
+            mapfile -t hits < <(
+                printf '%s\n' "${SWEEP_IPS[@]}" \
+                | xargs -P "${DNS_JOBS}" -I{} bash -c 'resolve_one "$1" "$2" "$3"' _ {} "${sweep_doms[*]}" "$DNS_SERVER" || true
+            )
+            if [[ ${#hits[@]} -gt 0 ]]; then
+                rows+=("${hits[@]}")
+            fi
+        fi
+    fi
+
+    # 3) Merge into HOSTS
+    if [[ ${#rows[@]} -gt 0 ]]; then
+        while IFS=$'\t' read -r ip name status; do
+            if [[ -z "$ip" ]]; then
+                continue
+            fi
+            if is_local_ip "$ip"; then
+                skipped_self=$((skipped_self + 1))
+                log_verbose "Skipping this machine (${name} / ${ip})"
+                continue
+            fi
+            target="$name"
+            if [[ "$status" != "ok" ]]; then
+                log_warn "${name} does not resolve forward to ${ip}; using the IP instead"
+                target="$ip"
+            fi
+            if ! valid_host "$target"; then
+                log_warn "Skipping unusable host name '${target}'"
+                continue
+            fi
+            if host_in_list "$target" || host_in_list "$ip" || host_in_list "$name"; then
+                continue
+            fi
+            HOSTS+=("$target")
+            added=$((added + 1))
+        done < <(printf '%s\n' "${rows[@]}" | sort -uV)
+    fi
+
+    if [[ $added -eq 0 ]]; then
+        log_warn "No hosts found under: ${norm[*]}. Check that those names have PTR (reverse) records, or pass --dns-server / --subnet."
+    else
+        log_info "Domain discovery added ${added} host(s)"
+    fi
+    if [[ $skipped_self -gt 0 ]]; then
+        log_verbose "Skipped ${skipped_self} address(es) belonging to this machine"
+    fi
+}
+
+# ─────────────────────────────────────────────
+# Exclusions
+# ─────────────────────────────────────────────
+
+# Prints the identifiers a host can be matched by: the host itself plus its
+# reverse names (if it is an IP) or its addresses (if it is a name).
+host_ids() {
+    local h="$1"
+    printf '%s\n' "$h"
+    if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        dns_ptr "$h" "$DNS_SERVER"
+    else
+        dns_a "$h" "$DNS_SERVER"
+    fi
+}
+
+normalize_excludes() {
+    local p
+    EXCLUDE_PATS=()
+    if [[ ${#EXCLUDES[@]} -eq 0 ]]; then
+        return 0
+    fi
+    for p in "${EXCLUDES[@]}"; do
+        p="${p,,}"
+        p="${p%.}"
+        if [[ "$p" == .* ]]; then
+            p="*${p}"
+        fi
+        EXCLUDE_PATS+=("$p")
+    done
+}
+
+apply_excludes() {
+    local h id pat hit removed=0
+    local -a kept=()
+
+    if [[ ${#EXCLUDE_PATS[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    for h in "${HOSTS[@]}"; do
+        hit=""
+        while IFS= read -r id; do
+            id="${id,,}"
+            if [[ -z "$id" ]]; then
+                continue
+            fi
+            for pat in "${EXCLUDE_PATS[@]}"; do
+                # shellcheck disable=SC2053  # unquoted on purpose: glob match
+                if [[ "$id" == $pat ]]; then
+                    hit="pattern '${pat}' matched ${id}"
+                    break 2
+                fi
+            done
+        done < <(host_ids "$h")
+
+        if [[ -n "$hit" ]]; then
+            log_info "Excluding ${h}: ${hit}"
+            removed=$((removed + 1))
+        else
+            kept+=("$h")
+        fi
+    done
+
+    if [[ ${#kept[@]} -gt 0 ]]; then
+        HOSTS=("${kept[@]}")
+    else
+        HOSTS=()
+    fi
+    log_verbose "Exclusions removed ${removed} host(s)"
+}
+
+# ─────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -k) need_arg "$@"; SSH_KEY="$2"; shift 2 ;;
+        -p) need_arg "$@"; LOGIN_PASSWORD="$2"; PASSWORD_FROM_CLI=true; shift 2 ;;
+        -u) need_arg "$@"; REMOTE_USER="$2"; shift 2 ;;
+        -h) need_arg "$@"; mapfile -t -O "${#HOSTS[@]}" HOSTS < <(parse_list_input "$2"); shift 2 ;;
+        -H) need_arg "$@"; mapfile -t -O "${#HOSTS[@]}" HOSTS < <(parse_list_input "$2"); shift 2 ;;
+        -D) need_arg "$@"; mapfile -t -O "${#DOMAINS[@]}" DOMAINS < <(parse_list_input "$2" no); shift 2 ;;
+        -x) need_arg "$@"; mapfile -t -O "${#EXCLUDES[@]}" EXCLUDES < <(parse_list_input "$2"); shift 2 ;;
+        --subnet) need_arg "$@"; mapfile -t -O "${#SUBNETS[@]}" SUBNETS < <(parse_list_input "$2" no); shift 2 ;;
+        --dns-server) need_arg "$@"; DNS_SERVER="$2"; shift 2 ;;
+        --axfr-server) need_arg "$@"; AXFR_SERVER="$2"; shift 2 ;;
+        --list-hosts) LIST_ONLY=true; shift ;;
+        -e) ENV_HOSTS=true; shift ;;
+        -a) AUTO_DISCOVER=true; shift ;;
+        -s) USE_SUDO=true; shift ;;
+        -y) ASSUME_YES=true; shift ;;
+        -d) need_arg "$@"; DIRECTORY_MODE=true; SOURCE_DIR="$2"; shift 2 ;;
+        -o) need_arg "$@"; REMOTE_PATH="$2"; shift 2 ;;
+        -v) VERBOSE=true; shift ;;
+        --mp) need_arg "$@"; MAX_PARALLEL="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --delete) DELETE=true; shift ;;
+        --no-parallel) PARALLEL=false; shift ;;
+        --help|-\?) usage; exit 0 ;;
+        --) shift; SOURCES+=("$@"); break ;;
+        -*) log_err "Unknown option: $1"; usage; exit 1 ;;
+        *) SOURCES+=("$1"); shift ;;
+    esac
+done
+
+# ─────────────────────────────────────────────
+# Validate inputs
+# ─────────────────────────────────────────────
+if ! [[ "$MAX_PARALLEL" =~ ^[0-9]+$ ]]; then
+    log_err "Invalid value for --mp: '$MAX_PARALLEL'. Must be a positive integer."
+    exit 1
+elif [[ "$MAX_PARALLEL" -eq 0 ]]; then
+    log_err "Invalid value for --mp: 0. To disable parallel syncing use --no-parallel."
+    exit 1
+fi
+
+if ! valid_user "$REMOTE_USER"; then
+    log_err "Invalid remote username: '$REMOTE_USER'"
+    exit 1
+fi
+
+if [[ -n "$DNS_SERVER" ]]; then
+    if ! valid_host "$DNS_SERVER"; then
+        log_err "Invalid --dns-server value: '$DNS_SERVER'"
+        exit 1
+    fi
+    if ! command -v dig &>/dev/null; then
+        log_err "--dns-server needs dig, which was not found (package: dnsutils or bind-utils)."
+        exit 1
+    fi
+fi
+
+if [[ -n "$AXFR_SERVER" ]]; then
+    if ! valid_host "$AXFR_SERVER"; then
+        log_err "Invalid --axfr-server value: '$AXFR_SERVER'"
+        exit 1
+    fi
+    if [[ ${#DOMAINS[@]} -eq 0 ]]; then
+        log_err "--axfr-server only makes sense together with -D <domain>."
+        exit 1
+    fi
+fi
+
+if [[ ${#SUBNETS[@]} -gt 0 && ${#DOMAINS[@]} -eq 0 ]]; then
+    log_err "--subnet only makes sense together with -D <domain>."
+    exit 1
+fi
+
+# Checks that only matter when files are actually going to be transferred
+validate_transfer_args() {
+    local f tool
+
+    if [[ -n "$SSH_KEY" ]]; then
+        SSH_KEY="${SSH_KEY/#\~/$HOME}"
+        if [[ ! -f "$SSH_KEY" ]]; then
+            log_err "SSH key file not found: $SSH_KEY"
+            exit 1
+        fi
+    fi
+
+    if [[ -z "$REMOTE_PATH" ]]; then
+        log_err "Remote destination path (-o) is required."
+        usage; exit 1
+    fi
+
+    if $DIRECTORY_MODE; then
+        if [[ -z "$SOURCE_DIR" ]]; then
+            log_err "-d requires a directory argument."
+            exit 1
+        fi
+        if [[ ! -d "$SOURCE_DIR" ]]; then
+            log_err "Source directory does not exist: $SOURCE_DIR"
+            exit 1
+        fi
+        if [[ ${#SOURCES[@]} -gt 0 ]]; then
+            log_warn "Positional file arguments ignored in directory mode (-d)."
+        fi
+    else
+        if [[ ${#SOURCES[@]} -eq 0 ]]; then
+            log_err "No source files specified. Use -d for directory mode."
+            usage; exit 1
+        fi
+        for f in "${SOURCES[@]}"; do
+            if [[ ! -e "$f" ]]; then
+                log_err "Source path does not exist: $f"
+                exit 1
+            fi
+        done
+    fi
+
+    if $DELETE; then
+        if ! $DIRECTORY_MODE; then
+            log_err "--delete is only allowed with -d. In file mode it would remove every other file in the destination."
+            exit 1
+        fi
+        if [[ "$REMOTE_PATH" == "/" ]]; then
+            log_err "Refusing to use --delete with a remote path of '/'."
+            exit 1
+        fi
+    fi
+
+    for tool in rsync ssh; do
+        if ! command -v "$tool" &>/dev/null; then
+            log_err "Required tool not found: $tool"
+            exit 1
+        fi
+    done
+}
+
+if ! $LIST_ONLY; then
+    validate_transfer_args
+fi
+
+# ─────────────────────────────────────────────
+# Collect hosts from environment variable (-e)
+# ─────────────────────────────────────────────
+if $ENV_HOSTS; then
+    if [[ -z "${!HOSTSYNC_ENV_VAR:-}" ]]; then
+        log_warn "\$${HOSTSYNC_ENV_VAR} is not set or empty, skipping."
+    else
+        mapfile -t -O "${#HOSTS[@]}" HOSTS < <(parse_list_input "${!HOSTSYNC_ENV_VAR}" no)
+        log_verbose "Loaded hosts from \$${HOSTSYNC_ENV_VAR}"
+    fi
+fi
+
+# ─────────────────────────────────────────────
+# Collect hosts from DNS domains (-D)
+# ─────────────────────────────────────────────
+if [[ ${#DOMAINS[@]} -gt 0 ]]; then
+    discover_domains
+fi
+
+# ─────────────────────────────────────────────
+# Auto-discover hosts (-a)
+# ─────────────────────────────────────────────
+if $AUTO_DISCOVER; then
+    echo -e "${YELLOW}${BOLD}AUTO-DISCOVER WARNING${RESET}"
+    echo    "   hostsync will query your kernel's ARP/NDP neighbour table ('ip n show')"
+    echo    "   and attempt to connect to EVERY IP found, including routers, printers,"
+    echo    "   smart TVs, IoT devices, and other hosts you may NOT want to sync to."
+    echo
+    read -rp "   Type YES to continue with auto-discovery: " _confirm
+    if [[ "$_confirm" != "YES" ]]; then
+        log_info "Auto-discovery cancelled by user."
+    else
+        mapfile -t _discovered < <(
+            ip n show 2>/dev/null \
+            | awk '/REACHABLE|STALE|DELAY|PROBE/{print $1}' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+        )
+        if [[ ${#_discovered[@]} -eq 0 ]]; then
+            log_warn "No reachable neighbours found in ARP table."
+        else
+            log_info "Discovered ${#_discovered[@]} neighbour(s): ${_discovered[*]}"
+            HOSTS+=("${_discovered[@]}")
+        fi
+    fi
+fi
+
+# Deduplicate
+if [[ ${#HOSTS[@]} -gt 0 ]]; then
+    mapfile -t HOSTS < <(printf '%s\n' "${HOSTS[@]}" | sort -u)
+fi
+
+if [[ ${#HOSTS[@]} -eq 0 ]]; then
+    log_err "No target hosts found. Use -h, -H, -e, -D, or -a."
+    usage; exit 1
+fi
+
+# Reject anything that could be parsed as an ssh/rsync option
+for h in "${HOSTS[@]}"; do
+    if ! valid_host "$h"; then
+        log_err "Invalid host name or address: '$h'"
+        exit 1
+    fi
+done
+
+# Apply exclusions (-x) to every host source
+normalize_excludes
+apply_excludes
+
+if [[ ${#HOSTS[@]} -eq 0 ]]; then
+    log_err "No target hosts remain after applying exclusions."
+    exit 1
+fi
+
+# ─────────────────────────────────────────────
+# --list-hosts: print the final targets and stop
+# ─────────────────────────────────────────────
+if $LIST_ONLY; then
+    echo
+    echo -e "${BOLD}Resolved ${#HOSTS[@]} target host(s):${RESET}"
+    printf '  %s\n' "${HOSTS[@]}"
+    exit 0
+fi
+
+# ─────────────────────────────────────────────
+# Auth mode, ssh and rsync options
+# ─────────────────────────────────────────────
+if [[ -n "$SSH_KEY" ]]; then
+    AUTH_MODE="key"
+else
+    AUTH_MODE="password"
+    if ! command -v sshpass &>/dev/null; then
+        log_err "sshpass is required for password logins. Install it or use -k <keyfile>."
+        exit 1
+    fi
+fi
+
+if $PASSWORD_FROM_CLI; then
+    log_warn "-p exposes the password in the process list and shell history. Prefer \$HOSTSYNC_PASSWORD or the prompt."
+fi
+
+if [[ "$AUTH_MODE" == "key" && -n "$LOGIN_PASSWORD" ]] && ! $USE_SUDO; then
+    log_warn "A password was given with -k but without -s, so it will not be used."
+    LOGIN_PASSWORD=""
+fi
+
+SSH_OPTS=(
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout="${CONNECT_TIMEOUT}"
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=3
+)
+if [[ "$AUTH_MODE" == "key" ]]; then
+    SSH_OPTS+=(-o BatchMode=yes -o PasswordAuthentication=no)
+else
+    SSH_OPTS+=(
+        -o PreferredAuthentications=password,keyboard-interactive
+        -o PubkeyAuthentication=no
+        -o NumberOfPasswordPrompts=1
+    )
+fi
+RSH_CMD="ssh ${SSH_OPTS[*]}"
+
+RSYNC_OPTS=(-az --mkpath --protect-args)
+if $DRY_RUN; then RSYNC_OPTS+=(--dry-run); fi
+if $VERBOSE; then RSYNC_OPTS+=(-v --progress); else RSYNC_OPTS+=(-q); fi
+if $DELETE; then DELETE_OPT=(--delete); fi
+
+# ─────────────────────────────────────────────
+# Single-host sync
+# ─────────────────────────────────────────────
+sync_host() {
+    local host="$1"
+    local prefix="${CYAN}[${host}]${RESET}"
+    local ssh_target="${REMOTE_USER}@${host}"
+    local rsync_target rc=0
+    rsync_target="${REMOTE_USER}@$(rsync_host "$host")"
+    local -a sources=()
+
+    if $DIRECTORY_MODE; then
+        sources=("${SOURCE_DIR%/}/")
+    else
+        sources=("${SOURCES[@]}")
+    fi
+
+    log_verbose "${prefix} Starting sync to ${ssh_target}:${REMOTE_PATH}"
+
+    # ---- Plain deployment: rsync straight to the destination ----
+    if ! $USE_SUDO; then
+        if run_logged "$host" "${AUTH_PREFIX[@]}" rsync "${RSYNC_OPTS[@]}" "${DELETE_OPT[@]}" \
+                -e "$RSH_CMD" "${sources[@]}" "${rsync_target}:${REMOTE_PATH}/"; then
+            log_success "${prefix} Sync complete to ${ssh_target}:${REMOTE_PATH}"
+            return 0
+        fi
+        log_err "${prefix} rsync failed (details in ${LOG_FILE})"
+        return 1
+    fi
+
+    # ---- Sudo deployment: stage as normal user, then one privileged rsync ----
+    local staging=""
+    staging=$("${AUTH_PREFIX[@]}" ssh "${SSH_OPTS[@]}" "$ssh_target" \
+        'mktemp -d /tmp/hostsync.XXXXXXXXXX' 2>>"${LOG_FILE}") || rc=$?
+    if [[ $rc -ne 0 || "$staging" != /tmp/hostsync.* ]]; then
+        log_err "${prefix} Could not create a staging directory (connection or login problem)"
+        return 1
+    fi
+
+    if ! run_logged "$host" "${AUTH_PREFIX[@]}" rsync "${RSYNC_OPTS[@]}" \
+            -e "$RSH_CMD" "${sources[@]}" "${rsync_target}:${staging}/"; then
+        log_err "${prefix} rsync to staging area failed (details in ${LOG_FILE})"
+        remote_cleanup "$ssh_target" "$staging"
+        return 1
+    fi
+
+    if $DRY_RUN; then
+        log_info "${prefix} Dry run: staging connection OK, sudo deploy step skipped"
+        remote_cleanup "$ssh_target" "$staging"
+        return 0
+    fi
+
+    # One sudo call. The password goes in over stdin (no -t, no command line).
+    # Args are shell-quoted with %q, and the staging dir is removed afterwards.
+    local del="" remote_cmd="" out="" deploy_rc=0
+    if $DELETE; then del="--delete"; fi
+    printf -v remote_cmd \
+        "sudo -S -p '' sh -c 'mkdir -p -- \"\$1\" && rsync -a %s -- \"\$2/\" \"\$1/\"' sh %q %q; rc=\$?; rm -rf -- %q; exit \$rc" \
+        "$del" "$REMOTE_PATH" "$staging" "$staging"
+
+    out=$(printf '%s\n' "$LOGIN_PASSWORD" \
+        | "${AUTH_PREFIX[@]}" ssh "${SSH_OPTS[@]}" "$ssh_target" "$remote_cmd" 2>&1) || deploy_rc=$?
+    if [[ -n "$out" ]]; then
+        log_file "[${host}] deploy output:"$'\n'"${out}"
+    fi
+
+    if [[ $deploy_rc -eq 0 ]]; then
+        log_success "${prefix} Sync complete (staged, deployed with sudo) to ${ssh_target}:${REMOTE_PATH}"
+        return 0
+    fi
+
+    log_err "${prefix} Privileged deploy failed (wrong sudo password, no sudo rights, or no rsync on the remote). See ${LOG_FILE}"
+    remote_cleanup "$ssh_target" "$staging"
+    return 1
+}
+
+# ─────────────────────────────────────────────
+# Pre-flight summary
+# ─────────────────────────────────────────────
+echo
+echo -e "${BOLD}hostsync transfer summary${RESET}"
+echo -e "  User      : ${REMOTE_USER}"
+if [[ "$AUTH_MODE" == "key" ]]; then
+    echo -e "  Auth      : SSH key (${SSH_KEY})"
+else
+    echo -e "  Auth      : password"
+fi
+if $DIRECTORY_MODE; then
+    echo -e "  Source    : [directory] ${SOURCE_DIR}"
+else
+    echo -e "  Sources   : ${SOURCES[*]}"
+fi
+echo -e "  Dest path : ${REMOTE_PATH}"
+echo -e "  Hosts (${#HOSTS[@]}): ${HOSTS[*]}"
+if [[ ${#DOMAINS[@]} -gt 0 ]];      then echo -e "  Domains   : ${DOMAINS[*]}"; fi
+if [[ ${#EXCLUDE_PATS[@]} -gt 0 ]]; then echo -e "  Excluding : ${EXCLUDE_PATS[*]}"; fi
+echo -e "  Log file  : ${LOG_FILE}"
+if $VERBOSE;  then echo -e "  Verbose   : on"; fi
+if $USE_SUDO; then echo -e "  Remote Sudo: enabled"; fi
+if $DRY_RUN;  then echo -e "  ${YELLOW}DRY RUN: no files will be transferred${RESET}"; fi
+if $DELETE;   then echo -e "  ${YELLOW}DELETE mode enabled (mirror)${RESET}"; fi
+if $PARALLEL && [[ ${#HOSTS[@]} -gt 1 ]]; then
+    echo -e "  Parallel  : up to ${MAX_PARALLEL} concurrent jobs"
+fi
+echo
+
+if ! $ASSUME_YES; then
+    read -rp "Proceed? [Y/n] " _go
+    case "${_go,,}" in
+        n|no) log_info "Aborted by user."; exit 0 ;;
+    esac
+fi
+
+# ─────────────────────────────────────────────
+# Credentials
+# ─────────────────────────────────────────────
+if [[ "$AUTH_MODE" == "key" ]]; then
+    eval "$(ssh-agent -s)" > /dev/null
+    _AGENT_PID="${SSH_AGENT_PID}"
+    export SSH_AUTH_SOCK SSH_AGENT_PID
+
+    log_info "Loading SSH key into a temporary ssh-agent..."
+    if ! ssh-add "$SSH_KEY"; then
+        log_err "Failed to add SSH key to the agent."
+        exit 1
+    fi
+
+    if $USE_SUDO && [[ -z "$LOGIN_PASSWORD" ]]; then
+        read -rsp "[hostsync] Remote sudo password for ${REMOTE_USER}: " LOGIN_PASSWORD
+        echo
+    fi
+else
+    if [[ -z "$LOGIN_PASSWORD" ]]; then
+        read -rsp "SSH login/sudo password for ${REMOTE_USER}@<hosts>: " LOGIN_PASSWORD
+        echo
+    fi
+    # sshpass -e reads the password from the environment, so it never appears in 'ps'
+    export SSHPASS="$LOGIN_PASSWORD"
+    AUTH_PREFIX=(sshpass -e)
+fi
+
+# ─────────────────────────────────────────────
+# Execute
+# ─────────────────────────────────────────────
+log_file "===== hostsync session start: user=${REMOTE_USER} dest=${REMOTE_PATH} hosts=${HOSTS[*]} ====="
+START_TIME=$SECONDS
+STATUS_DIR="$(mktemp -d)"
+
+idx=0
+if $PARALLEL && [[ ${#HOSTS[@]} -gt 1 ]]; then
+    log_info "Syncing to ${#HOSTS[@]} host(s) in parallel (max ${MAX_PARALLEL} jobs)..."
+    for host in "${HOSTS[@]}"; do
+        while (( $(jobs -rp | wc -l) >= MAX_PARALLEL )); do
+            wait -n || true
+        done
+        (
+            job_rc=0
+            sync_host "$host" || job_rc=$?
+            echo "$job_rc" > "${STATUS_DIR}/${idx}"
+        ) &
+        idx=$((idx + 1))
+    done
+    wait
+else
+    log_info "Syncing to ${#HOSTS[@]} host(s) sequentially..."
+    for host in "${HOSTS[@]}"; do
+        job_rc=0
+        sync_host "$host" || job_rc=$?
+        echo "$job_rc" > "${STATUS_DIR}/${idx}"
+        idx=$((idx + 1))
+    done
+fi
+
+# ─────────────────────────────────────────────
+# Collect results
+# ─────────────────────────────────────────────
+FAILED_HOSTS=()
+for ((i = 0; i < ${#HOSTS[@]}; i++)); do
+    status="$(cat "${STATUS_DIR}/${i}" 2>/dev/null || echo 1)"
+    if [[ "$status" != "0" ]]; then
+        FAILED_HOSTS+=("${HOSTS[$i]}")
+    fi
+done
+
+ELAPSED=$(( SECONDS - START_TIME ))
+log_file "===== hostsync session end: elapsed=${ELAPSED}s failed=${#FAILED_HOSTS[@]} ====="
+echo
+
+if [[ ${#FAILED_HOSTS[@]} -eq 0 ]]; then
+    log_success "All ${#HOSTS[@]} host(s) done in ${ELAPSED}s.  Log: ${LOG_FILE}"
+    exit 0
+fi
+
+log_err "${#FAILED_HOSTS[@]} of ${#HOSTS[@]} host(s) failed: ${FAILED_HOSTS[*]}  (${ELAPSED}s, log: ${LOG_FILE})"
+exit 1

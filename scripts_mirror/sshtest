@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+#
+# sshwait.sh — wait for a host to come up and accept SSH logins.
+#
+# Usage:
+#   ./sshwait.sh [-v ... up to -vvvv] [-p PORT] [-i SECONDS] USER HOST
+#
+# Examples:
+#   ./sshwait.sh awesomeshot5051 192.168.0.139
+#   ./sshwait.sh -vv -p 2222 awesomeshot5051 192.168.0.139
+#   ./sshwait.sh -vvvv -i 2 awesomeshot5051 traes-pc.local
+#
+# You will be prompted for the password (input is hidden, like normal ssh).
+# It is fed to ssh via sshpass using the SSHPASS environment variable so it
+# never shows up in `ps`, and it's unset as soon as the script exits.
+#
+# Verbosity:
+#   (none)  only the final "online" message
+#   -v      print each attempt (timestamp, attempt #)
+#   -vv     also print port-open / port-closed status
+#   -vvv    also print "attempting ssh login" status
+#   -vvvv   also print full `ssh -vvv` debug output per attempt
+#
+# Requires: bash, sshpass (sudo apt install sshpass)
+#           Falls back to a TCP-port-only check if sshpass isn't installed
+#           (password won't actually be verified in that mode).
+
+set -u
+
+PORT=22
+INTERVAL=3
+VERBOSE=0
+POSITIONAL=()
+
+usage() {
+    grep '^#' "$0" | sed -e 's/^#//' -e '1d'
+    exit "${1:-0}"
+}
+
+# ---- argument parsing -------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage 0
+            ;;
+        -p)
+            [[ $# -ge 2 ]] || { echo "sshwait: -p requires a port" >&2; exit 1; }
+            PORT="$2"; shift 2
+            ;;
+        --port=*)
+            PORT="${1#*=}"; shift
+            ;;
+        -i)
+            [[ $# -ge 2 ]] || { echo "sshwait: -i requires seconds" >&2; exit 1; }
+            INTERVAL="$2"; shift 2
+            ;;
+        --interval=*)
+            INTERVAL="${1#*=}"; shift
+            ;;
+        -v|-vv|-vvv|-vvvv)
+            # count the v's in this token and add them to VERBOSE
+            count=$(tr -dc 'v' <<< "$1" | wc -c)
+            VERBOSE=$(( VERBOSE + count ))
+            shift
+            ;;
+        -*)
+            echo "sshwait: unknown option: $1" >&2
+            usage 1
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#POSITIONAL[@]} -ne 2 ]]; then
+    echo "sshwait: expected USER and HOST" >&2
+    usage 1
+fi
+
+USERNAME="${POSITIONAL[0]}"
+HOST="${POSITIONAL[1]}"
+
+if (( VERBOSE > 4 )); then VERBOSE=4; fi
+
+# ---- password prompt (hidden input, like normal ssh) -------------------
+read -r -s -p "Password for ${USERNAME}@${HOST}: " SSHWAIT_PASS
+echo
+export SSHPASS="$SSHWAIT_PASS"
+unset SSHWAIT_PASS
+
+HAVE_SSHPASS=1
+if ! command -v sshpass >/dev/null 2>&1; then
+    HAVE_SSHPASS=0
+    echo "sshwait: warning: sshpass not found, will only test that port $PORT is open" >&2
+    echo "         (install with: sudo apt install sshpass)" >&2
+fi
+
+cleanup() {
+    unset SSHPASS
+}
+trap cleanup EXIT
+trap 'echo; echo "sshwait: interrupted."; exit 130' INT
+
+log() {
+    local lvl="$1"; shift
+    (( VERBOSE >= lvl )) && echo "$@"
+}
+
+# ---- port check (pure bash, no external deps) ---------------------------
+port_open() {
+    (exec 3<>"/dev/tcp/${HOST}/${PORT}") 2>/dev/null
+    local rc=$?
+    exec 3>&- 2>/dev/null
+    exec 3<&- 2>/dev/null
+    return $rc
+}
+
+attempt=0
+start_ts=$(date +%s)
+
+echo "Waiting for SSH on ${USERNAME}@${HOST}:${PORT} (checking every ${INTERVAL}s, Ctrl+C to stop)..."
+
+while true; do
+    attempt=$((attempt + 1))
+    log 1 "[attempt $attempt] $(date '+%H:%M:%S') checking ${HOST}:${PORT}..."
+
+    if port_open; then
+        log 2 "  -> port ${PORT} is open"
+
+        if [[ $HAVE_SSHPASS -eq 1 ]]; then
+            log 3 "  -> attempting ssh login as ${USERNAME}..."
+
+            SSH_OPTS=(-o BatchMode=no -o StrictHostKeyChecking=accept-new
+                      -o ConnectTimeout=5 -o PreferredAuthentications=password,keyboard-interactive
+                      -p "$PORT")
+            if (( VERBOSE >= 4 )); then
+                SSH_OPTS+=(-vvv)
+            fi
+
+            if (( VERBOSE >= 4 )); then
+                OUTPUT=$(sshpass -e ssh "${SSH_OPTS[@]}" "${USERNAME}@${HOST}" 'echo __SSHWAIT_OK__' 2>&1)
+            else
+                OUTPUT=$(sshpass -e ssh "${SSH_OPTS[@]}" "${USERNAME}@${HOST}" 'echo __SSHWAIT_OK__' 2>&1)
+            fi
+            RC=$?
+
+            log 4 "----- ssh debug output (attempt $attempt) -----"
+            log 4 "$OUTPUT"
+            log 4 "-------------------------------------------------"
+
+            if [[ $RC -eq 0 ]] && grep -q "__SSHWAIT_OK__" <<< "$OUTPUT"; then
+                break
+            fi
+
+            # The port is open and sshd is answering, so a permission/auth
+            # failure here is a real "wrong password", not "not up yet" —
+            # stop and say so instead of retrying forever.
+            if grep -qiE "permission denied|authentication failed|too many authentication failures" <<< "$OUTPUT"; then
+                echo -e "\a"
+                echo "sshwait: SSH is up, but login failed — wrong password (or account/key restrictions) for ${USERNAME}@${HOST}." >&2
+                if (( VERBOSE < 4 )); then
+                    echo "         (re-run with -vvvv to see the full ssh output)" >&2
+                fi
+                exit 2
+            fi
+
+            log 2 "  -> login not ready yet (exit code $RC)"
+        else
+            # No sshpass: port being open is the best we can confirm.
+            break
+        fi
+    else
+        log 2 "  -> port ${PORT} closed/unreachable"
+    fi
+
+    sleep "$INTERVAL"
+done
+
+elapsed=$(( $(date +%s) - start_ts ))
+echo -e "\a"
+if [[ $HAVE_SSHPASS -eq 1 ]]; then
+    echo "${HOST} is online and accepting SSH logins as ${USERNAME}! (${attempt} attempts, ${elapsed}s)"
+else
+    echo "${HOST} port ${PORT} is open (SSH login not verified — sshpass unavailable). (${attempt} attempts, ${elapsed}s)"
+fi

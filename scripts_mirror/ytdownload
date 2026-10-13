@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# ytdownload — wrapper around yt-dlp with mp4/mp3/mov/wav output types.
+#
+# Usage:
+#   ytdownload -u URL [-t mp4|mp3|mov|wav]
+#
+#   -u URL   Required. The video/audio URL to download.
+#   -t TYPE  Optional. One of mp4, mp3, mov, wav. Defaults to mp4 if omitted.
+#
+#   mp4  -> downloaded directly as MP4 via yt-dlp's built-in -t mp4 preset
+#   mp3  -> downloaded directly as MP3 via yt-dlp's built-in -t mp3 preset
+#   mov  -> downloaded as MP4, then converted to MOV with tovinci
+#   wav  -> downloaded as MP3 (best audio), then converted to WAV with tovinci
+#
+# tovinci is called as:  tovinci <downloaded_file>
+# which produces <basename>_davinci.<mov|wav> alongside the original.
+
+set -euo pipefail
+
+# Name/path of your yt-dlp binary — change if it's just "yt-dlp" on your PATH
+YTDLP="yt-dlp_linux"
+TOVINCI="/usr/local/bin/tovinci"
+
+# Video format selection: sorts by RESOLUTION first (unlike the built-in
+# -t mp4 preset, which sorts by h264 codec first and can settle for a
+# lower-res h264 stream over a higher-res vp9/av1 one). Among equal
+# resolutions, prefer h264/aac for compatibility, then merge/remux to mp4.
+VIDEO_FMT=(-f "bv*+ba/b" -S "res,fps,hdr:12,vcodec:h264,acodec:aac" --merge-output-format mp4 --remux-video mp4)
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") -u URL [-t mp4|mp3|mov|wav]
+
+  -u URL   Required. Video/audio URL to download.
+  -t TYPE  Optional. Output type: mp4, mp3, mov, or wav (default: mp4).
+  -h       Show this help
+EOF
+    exit 1
+}
+
+url=""
+type="mp4"
+
+while getopts "u:t:h" opt; do
+    case "$opt" in
+        u) url="$OPTARG" ;;
+        t) type="$OPTARG" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+if [[ -z "$url" ]]; then
+    echo "Error: -u URL is required." >&2
+    usage
+fi
+
+if ! command -v "$YTDLP" >/dev/null 2>&1; then
+    echo "Error: '$YTDLP' not found on PATH. Edit the YTDLP variable at the top of this script." >&2
+    exit 1
+fi
+
+case "$type" in
+    mp4)
+        echo "Downloading '$url' as MP4 (highest quality available)..."
+        "$YTDLP" "${VIDEO_FMT[@]}" "$url"
+        ;;
+
+    mp3)
+        echo "Downloading '$url' as MP3..."
+        "$YTDLP" -t mp3 "$url"
+        ;;
+
+    mov)
+        if ! command -v "$TOVINCI" >/dev/null 2>&1; then
+            echo "Error: tovinci not found at $TOVINCI" >&2
+            exit 1
+        fi
+        echo "Downloading '$url' as MP4, highest quality available (will convert to MOV)..."
+        downloaded_file=$("$YTDLP" "${VIDEO_FMT[@]}" --print after_move:filepath "$url" | tail -n 1)
+        echo "Downloaded: $downloaded_file"
+        echo "Converting to MOV with tovinci..."
+        "$TOVINCI" "$downloaded_file"
+        ;;
+
+    wav)
+        if ! command -v "$TOVINCI" >/dev/null 2>&1; then
+            echo "Error: tovinci not found at $TOVINCI" >&2
+            exit 1
+        fi
+        echo "Downloading '$url' as best audio (will convert to WAV)..."
+        downloaded_file=$("$YTDLP" -t mp3 --print after_move:filepath "$url" | tail -n 1)
+        echo "Downloaded: $downloaded_file"
+        echo "Converting to WAV with tovinci..."
+        "$TOVINCI" "$downloaded_file"
+        ;;
+
+    *)
+        echo "Invalid type: '$type'. Must be one of: mp4, mp3, mov, wav." >&2
+        exit 1
+        ;;
+esac
+
+echo "Done."
