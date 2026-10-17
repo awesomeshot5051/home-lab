@@ -5,12 +5,17 @@
 #   sudo rawproject preview "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
 #   sudo rawproject finish [--yes] "Trae/YouTube/Darth Revan Gaming/Videos/AceCombat8/Mission 3"
 #   rawproject list
+#
+# Optional environment variable:
+#   RAWPROJECT_NFS_FALLBACK=0   never stop nfs-server as a last resort (default 1)
 set -euo pipefail
 
 POOL="storage"
 PARENT="${POOL}/raw"
 ROOT="/mnt/MergedStorage"
 OWNER="awesomeshot5051"
+NFS_UNIT="nfs-server"
+NFS_FALLBACK="${RAWPROJECT_NFS_FALLBACK:-1}"
 
 usage() {
     echo "Usage: rawproject create|preview|finish [--yes] \"<project path relative to ${ROOT}>\""
@@ -43,6 +48,33 @@ ensure_parent() {
         zfs create -o canmount=off -o mountpoint=none \
             -o recordsize=1M -o compression=lz4 -o atime=off "$PARENT"
         echo "Created container dataset ${PARENT}"
+    fi
+}
+
+# Create a directory path like mkdir -p, but give every directory that did not
+# exist before to OWNER instead of leaving it owned by root. Directories that
+# already existed are left exactly as they were.
+make_dirs_owned() {
+    local target="$1" d="$1" n
+    local -a created=()
+    while [[ ! -d "$d" ]]; do
+        created+=("$d")
+        d="$(dirname "$d")"
+    done
+    mkdir -p "$target"
+    for n in ${created[@]+"${created[@]}"}; do
+        chown "${OWNER}:${OWNER}" "$n"
+        chmod 775 "$n"
+    done
+}
+
+# Ask nfsd to let go of a path. The crossmnt export on the parent makes nfsd
+# keep a kernel reference to nested datasets that lsof and fuser cannot see.
+release_nfs_holds() {
+    local mp="$1"
+    exportfs -f 2>/dev/null || true
+    if [[ -w /proc/fs/nfsd/unlock_filesystem ]]; then
+        printf '%s\n' "$mp" > /proc/fs/nfsd/unlock_filesystem 2>/dev/null || true
     fi
 }
 
@@ -82,7 +114,7 @@ case "$cmd" in
         fi
 
         ensure_parent
-        mkdir -p "${ROOT}/${rel}"
+        make_dirs_owned "${ROOT}/${rel}"
         zfs create -o mountpoint="$mp" "$ds"
         chown "${OWNER}:${OWNER}" "$mp"
         chmod 775 "$mp"
@@ -128,25 +160,59 @@ case "$cmd" in
             fi
         fi
 
-        # NFS clients and nfsd can pin the mount, so flush the export cache
-        # first and retry a few times before giving up.
+        # Clones cannot be fixed by releasing mounts, so stop early and do not
+        # disturb NFS for a failure that bouncing nfsd would never solve.
+        clones="$(zfs get -H -o value clones "$ds" 2>/dev/null || true)"
+        if [[ -n "$clones" && "$clones" != "-" ]]; then
+            echo "${ds} has clones: ${clones}" >&2
+            echo "Promote or destroy the clones first." >&2
+            exit 1
+        fi
+
         errfile="$(mktemp)"
-        trap 'rm -f "$errfile"' EXIT
+        nfs_stopped=0
+        cleanup() {
+            rm -f "$errfile"
+            if [[ $nfs_stopped -eq 1 ]]; then
+                systemctl start "$NFS_UNIT" || true
+            fi
+        }
+        trap cleanup EXIT
+
         destroyed=0
-        for attempt in 1 2 3 4 5; do
-            exportfs -f 2>/dev/null || true
+
+        # Stage 1: release nfsd's hold on the nested mount, then retry.
+        for attempt in 1 2 3; do
+            release_nfs_holds "$mp"
             if zfs destroy -r "$ds" 2>"$errfile"; then
                 destroyed=1
                 break
             fi
             echo "Attempt ${attempt} failed: $(cat "$errfile")"
-            sleep 3
+            sleep 2
         done
+
+        # Stage 2: briefly stop nfs-server, which drops every kernel reference.
+        # NFS is always started again afterward, even if the destroy fails.
+        if [[ $destroyed -ne 1 && "$NFS_FALLBACK" == "1" ]]; then
+            echo "Still busy. Stopping ${NFS_UNIT} briefly to release the dataset."
+            nfs_stopped=1
+            systemctl stop "$NFS_UNIT"
+            sleep 1
+            if zfs destroy -r "$ds" 2>"$errfile"; then
+                destroyed=1
+            else
+                echo "Destroy failed with NFS stopped: $(cat "$errfile")" >&2
+            fi
+            systemctl start "$NFS_UNIT" || true
+            nfs_stopped=0
+        fi
 
         if [[ $destroyed -ne 1 ]]; then
             echo "Dataset is still busy. Current holders of ${mp}:" >&2
             fuser -vm "$mp" 2>&1 || true
-            echo "If a client still has it mounted, unmount the nested path there first." >&2
+            echo "Check for another NFS client with the nested path mounted," >&2
+            echo "or a local process inside it, then rerun." >&2
             exit 1
         fi
 
