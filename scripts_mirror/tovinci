@@ -1,936 +1,1145 @@
-#!/usr/bin/env bash
-set -e
-set -o pipefail
+#!/usr/bin/env python3
+"""tovinci: convert media into DaVinci Resolve (Linux) friendly formats.
 
-LOG_FILE="${HOME:-/tmp}/tovinci.log"
-RUN_MARKER="=== RUN START"
-VERBOSE_LEVEL=0     # 0=quiet, 1=-v (steps + brief ffmpeg summary), 2=-vv (full live ffmpeg output)
-TARGET_TYPE=""      # optional override via -t (wav, wav-16, wav-24, wav-32)
-BITS_OVERRIDE=""    # forced PCM bit depth via --bits N or -t wav-N (empty = match each source track)
-THREADED=false      # forced via --threaded
-JOBS=1              # concurrent files, via -j/--jobs
-AUTO_THREAD_BYTES=$((10 * 1024 * 1024 * 1024))  # 10GB auto-threading threshold
-GPU_REQUESTED=false # via -use-gpu=true
-GPU_HWACCEL=""      # detected backend: cuda / vaapi / qsv, empty = none available
-GPU_HWACCEL_DEVICE="" # e.g. /dev/dri/renderD128 for vaapi
-COMBINE=false       # via -c/--combine: merge all inputs into one video first
-COMBINE_NAME=""     # optional output name (no extension) for the combined video
-NO_CONVERT=false    # via --no-convert: only combine, skip DaVinci conversion (requires -c)
-COMBINE_AUDIO=false # via -ca/--combine-audio: mix all audio tracks/channels into one stereo track
-SPLIT_AUDIO=false   # via -sa/--split-audio: write each audio track as its own WAV (video-only .mov)
+Videos become DNxHR (HQ for 8-bit sources, HQX for high bit-depth sources) in a
+.mov with uncompressed PCM audio, audio-only files become WAV, and images become
+high-quality JPEG. With -t, videos can instead become a much smaller H.264/AAC
+.mp4 (mp4, mp4-small) or ProRes in a .mov (prores, prores-422, prores-lt,
+prores-proxy). Several clips can be combined into one output in a single
+pass (-c), audio tracks can be mixed (-ca) or written as separate WAVs (-sa),
+and long jobs can be resumed after an interruption (-r).
 
-usage() {
-    echo "Usage: $(basename "$0") [-v|-vv] [-t wav|wav-16|wav-24|wav-32] [--bits 16|24|32] [--threaded] [-j N|--jobs N] [-use-gpu=true|false] [-ca|--combine-audio] [-sa|--split-audio] [-c [NAME]|--combine[=NAME]] [--no-convert] <file_or_pattern> [file_or_pattern ...]"
-    echo "  e.g. $(basename "$0") clip.mov"
-    echo "       $(basename "$0") -v *.png                # step log + brief ffmpeg summary"
-    echo "       $(basename "$0") -vv *.png               # full raw ffmpeg output, streamed live"
-    echo "       $(basename "$0") -t wav song.mp3         # force audio-only, ignore embedded art/video"
-    echo "       $(basename "$0") -t wav-16 song.flac     # force audio-only AND 16-bit PCM"
-    echo "       $(basename "$0") -t wav-24 song.mp3      # force audio-only AND 24-bit PCM"
-    echo "       $(basename "$0") --bits 16 clip.mov      # normal conversion, but force 16-bit PCM audio"
-    echo "       $(basename "$0") --threaded huge_clip.mov  # force multi-threaded encoding regardless of size"
-    echo "       $(basename "$0") -j 4 *.mov              # process up to 4 files concurrently"
-    echo "       $(basename "$0") -use-gpu=true clip.mov  # decode on GPU (NVDEC/VAAPI/QSV) if available; encode stays on CPU"
-    echo "       $(basename "$0") -ca clip.mov            # mix all audio tracks into one stereo track (default keeps them separate)"
-    echo "       $(basename "$0") -sa clip.mov            # video-only .mov plus one WAV per audio track (clip_davinci_a1.wav, ...)"
-    echo "       $(basename "$0") -c AceCombat8 a.mov b.mov   # combine, then convert -> AceCombat8.mov"
-    echo "       $(basename "$0") -c a.mov b.mov              # combine, then convert -> a_combined.mov"
-    echo "       $(basename "$0") -c AceCombat8 --no-convert a.mov b.mov  # combine only, no conversion"
-    echo "       $(basename "$0") -c -ca AceCombat8 a.mov b.mov           # combine, mix audio, then convert"
-    echo "       $(basename "$0") -c -sa AceCombat8 a.mov b.mov           # combine, then AceCombat8.mov + AceCombat8_a1.wav, _a2.wav"
-    echo "  PCM audio bit depth defaults to each source track's depth (lossy sources such as AAC become 16-bit)."
-    exit 1
+Changelog:
+  2.3.0  Restored the -t video types: mp4, mp4-small, prores, prores-hq, prores-422,
+         prores-lt, prores-proxy (they had been lost from the Python rewrite).
+  2.2.0  Added --version / -V.
+  2.1.0  Clips are combined in natural order (1, 2, ... 10); added --keep-order.
+  2.0.0  Rewritten in Python (was a bash script, 1.x); added -r/--resumable
+         with --restart, --keep-work and --work-dir; ffmpeg always runs with -nostdin.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "2.3.0"
+RUN_MARKER = "=== RUN START"
+AUTO_THREAD_BYTES = 10 * 1024 * 1024 * 1024  # 10GB auto-threading threshold
+FORBIDDEN_CACHE_ROOT = "/mnt/Data"  # resume data must never live on the secondary drive
+RULE = "-" * 56
+
+MP4_CRF = "18"        # visually near-lossless
+MP4_CRF_SMALL = "23"  # noticeably smaller, still good quality
+MP4_AUDIO_BITRATE = "192k"
+# ProRes profile name -> (prores_ks profile number, display label)
+PRORES_PROFILES = {
+    "proxy": ("0", "ProRes 422 Proxy"),
+    "lt": ("1", "ProRes 422 LT"),
+    "422": ("2", "ProRes 422"),
+    "hq": ("3", "ProRes 422 HQ"),
 }
+TYPE_CHOICES = ("wav, wav-16, wav-24, wav-32, mp4, mp4-small, prores, prores-hq, "
+                "prores-422, prores-lt, prores-proxy")
 
-# --- Helpers used while parsing arguments ---
-has_media_ext() {
-    local arg="$1" ext
-    case "$arg" in
-        *.*) ;;
-        *) return 1 ;;
-    esac
-    ext=$(echo "${arg##*.}" | tr '[:upper:]' '[:lower:]')
-    case "$ext" in
-        mov|mp4|mkv|avi|webm|m4v|mpg|mpeg|ts|mts|m2ts|wmv|flv|mxf|ogv|3gp) return 0 ;;
-        mp3|wav|flac|aac|m4a|ogg|opus|wma|aif|aiff) return 0 ;;
-        jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2) return 0 ;;
-    esac
-    return 1
-}
+VIDEO_EXTS = {"mov", "mp4", "mkv", "avi", "webm", "m4v", "mpg", "mpeg", "ts", "mts",
+              "m2ts", "wmv", "flv", "mxf", "ogv", "3gp"}
+AUDIO_EXTS = {"mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "wma", "aif", "aiff"}
+IMAGE_EXTS = {"jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff", "webp", "heic", "heif",
+              "exr", "dpx", "psd", "tga", "jp2"}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
 
-is_image_ext() {
-    local ext
-    ext=$(echo "${1##*.}" | tr '[:upper:]' '[:lower:]')
-    case "$ext" in
-        jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2) return 0 ;;
-    esac
-    return 1
-}
+EXAMPLES = """\
+examples:
+  tovinci clip.mov
+  tovinci -v *.png                 step log + brief ffmpeg progress
+  tovinci -vv *.png                full raw ffmpeg output, streamed live
+  tovinci -t wav song.mp3          force audio-only, ignore embedded art/video
+  tovinci -t wav-16 song.flac      force audio-only AND 16-bit PCM
+  tovinci -t mp4 clip.mov          small H.264/AAC .mp4 instead of DNxHR
+  tovinci -t mp4-small clip.mov    even smaller .mp4 (lower quality)
+  tovinci -t prores clip.mov       ProRes 422 HQ in a .mov
+  tovinci -t prores-lt clip.mov    smaller ProRes (422 LT)
+  tovinci --bits 16 clip.mov       normal conversion, but force 16-bit PCM audio
+  tovinci --threaded huge.mov      force multi-threaded encoding regardless of size
+  tovinci -j 4 *.mov               process up to 4 files concurrently
+  tovinci --use-gpu=true clip.mov  decode on GPU (NVDEC/VAAPI/QSV) if available
+  tovinci -ca clip.mov             mix all audio tracks into one stereo track
+  tovinci -sa clip.mov             video-only .mov plus one WAV per audio track
+  tovinci -c Name a.mov b.mov      combine, then convert -> Name.mov
+  tovinci -c Name -t mp4 a.mov b.mov          combine, then convert -> Name.mp4 (name goes right after -c)
+  tovinci -c a.mov b.mov           combine, then convert -> a_combined.mov
+  tovinci -c --keep-order Name b.mov a.mov    combine in exactly the order given
+  tovinci -c Name --no-convert a.mov b.mov    combine only, no conversion
+  tovinci -r -c -sa Name a.mov b.mov          resumable combine (re-run the same command to resume)
 
-# Decides whether the argument right after -c is the optional output name
-# (as opposed to the first input file). It is a name only if it is not another
-# option, not an existing file, not a glob pattern, and has no media extension.
-looks_like_name() {
-    local arg="$1"
-    case "$arg" in
-        -*) return 1 ;;
-    esac
-    [ -f "$arg" ] && return 1
-    case "$arg" in
-        *[\*\?\[]*) return 1 ;;
-    esac
-    has_media_ext "$arg" && return 1
-    return 0
-}
+types (-t):
+  wav, wav-16, wav-24, wav-32     audio-only WAV (the number forces the PCM bit depth)
+  mp4                             H.264 (CRF 18) + AAC 192k in .mp4, much smaller than DNxHR
+  mp4-small                       H.264 (CRF 23) + AAC 192k in .mp4, smaller still
+  prores, prores-hq               ProRes 422 HQ in .mov with PCM audio
+  prores-422                      ProRes 422
+  prores-lt                       ProRes 422 LT
+  prores-proxy                    ProRes 422 Proxy
+  Images still become JPEG and audio-only files still become WAV with the video types.
+  Note: the free DaVinci Resolve on Linux may not decode H.264/AAC mp4 files.
 
-# --- Pre-scan for long options (getopts can't parse --threaded / --jobs) ---
-declare -a ARGS=()
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --threaded)
-            THREADED=true
-            shift
-            ;;
-        --jobs)
-            JOBS="${2:-}"
-            shift 2
-            ;;
-        --jobs=*)
-            JOBS="${1#--jobs=}"
-            shift
-            ;;
-        --bits)
-            BITS_OVERRIDE="${2:-}"
-            shift 2
-            ;;
-        --bits=*)
-            BITS_OVERRIDE="${1#--bits=}"
-            shift
-            ;;
-        -ca|--combine-audio)
-            COMBINE_AUDIO=true
-            shift
-            ;;
-        -sa|--split-audio)
-            SPLIT_AUDIO=true
-            shift
-            ;;
-        -c|--combine)
-            COMBINE=true
-            shift
-            if [ "$#" -gt 0 ] && looks_like_name "$1"; then
-                COMBINE_NAME="$1"
-                shift
-            fi
-            ;;
-        --combine=*)
-            COMBINE=true
-            COMBINE_NAME="${1#--combine=}"
-            shift
-            ;;
-        --no-convert)
-            NO_CONVERT=true
-            shift
-            ;;
-        -use-gpu=*)
-            case "${1#-use-gpu=}" in
-                [Tt][Rr][Uu][Ee]) GPU_REQUESTED=true ;;
-                [Ff][Aa][Ll][Ss][Ee]) GPU_REQUESTED=false ;;
-                *)
-                    echo "Error: -use-gpu must be true or false (got '${1#-use-gpu=}')." >&2
-                    usage
-                    ;;
-            esac
-            shift
-            ;;
-        --)
-            ARGS+=("$1")
-            shift
-            while [ "$#" -gt 0 ]; do
-                ARGS+=("$1")
-                shift
-            done
-            ;;
-        *)
-            ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-set -- "${ARGS[@]}"
+PCM audio bit depth defaults to each source track's depth (lossy sources such as AAC become 16-bit).
+mp4 types use AAC audio, so --bits does not apply to them.
 
-# --- Argument parsing ---
-while getopts ":vt:j:" opt; do
-    case "$opt" in
-        v) VERBOSE_LEVEL=$((VERBOSE_LEVEL + 1)) ;;
-        t) TARGET_TYPE="$OPTARG" ;;
-        j) JOBS="$OPTARG" ;;
-        \?) usage ;;
-        :) usage ;;
-    esac
-done
-shift $((OPTIND - 1))
+clip order (-c):
+  Clips are combined in natural order (1, 2, ... 9, 10), not plain text order (1, 10, 2, ...),
+  so a shell glob like "Clip "*".mov" comes out right. If a different order was received, a note
+  says so. Use --keep-order to combine in exactly the order given.
 
-if [ -n "$TARGET_TYPE" ]; then
-    case "$TARGET_TYPE" in
-        wav) ;; # supported, bit depth follows the source
-        wav-16|wav-24|wav-32)
-            # Same audio-only mode as plain wav, with the bit depth forced.
-            BITS_OVERRIDE="${TARGET_TYPE#wav-}"
-            TARGET_TYPE="wav"
-            ;;
-        *)
-            echo "Error: unsupported -t type '$TARGET_TYPE' (supported: wav, wav-16, wav-24, wav-32)." >&2
-            usage
-            ;;
-    esac
-fi
+resume (-r):
+  Combine mode encodes one clip at a time into a work directory, then joins the finished
+  clips with a fast stream copy. If the run is interrupted, re-running the identical
+  command skips every clip that already finished. Batch mode skips files that already
+  finished. A clip that was mid-encode when interrupted is redone from its start.
+  The work directory defaults to ~/.cache/tovinci and may never be under /mnt/Data.
+  Peak disk use is roughly twice the final output (the parts plus the joined file).
+"""
 
-if [ -n "$BITS_OVERRIDE" ]; then
-    case "$BITS_OVERRIDE" in
-        16|24|32) ;;
-        *)
-            echo "Error: bit depth must be 16, 24 or 32 (got '$BITS_OVERRIDE')." >&2
-            usage
-            ;;
-    esac
-fi
 
-if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Error: -j/--jobs must be a positive integer (got '$JOBS')." >&2
-    usage
-fi
+class ToolError(Exception):
+    """A user-facing error: printed without a traceback."""
 
-if [ "$NO_CONVERT" = true ] && [ "$COMBINE" != true ]; then
-    echo "Error: --no-convert can only be used together with -c/--combine." >&2
-    usage
-fi
 
-if [ "$NO_CONVERT" = true ] && [ "$COMBINE_AUDIO" = true ]; then
-    echo "Error: -ca/--combine-audio cannot be used with --no-convert (mixing audio requires re-encoding it)." >&2
-    usage
-fi
+@dataclass
+class Options:
+    verbose: int = 0
+    target_type: str = ""
+    quality: str = ""
+    bits: str | None = None
+    threaded: bool = False
+    jobs: int = 1
+    gpu_requested: bool = False
+    combine: bool = False
+    combine_name: str = ""
+    no_convert: bool = False
+    combine_audio: bool = False
+    split_audio: bool = False
+    resumable: bool = False
+    keep_order: bool = False
+    restart: bool = False
+    keep_work: bool = False
+    work_dir: Path | None = None
 
-if [ "$NO_CONVERT" = true ] && [ "$SPLIT_AUDIO" = true ]; then
-    echo "Error: -sa/--split-audio cannot be used with --no-convert (splitting audio requires re-encoding it)." >&2
-    usage
-fi
 
-if [ "$COMBINE_AUDIO" = true ] && [ "$SPLIT_AUDIO" = true ]; then
-    echo "Error: -ca/--combine-audio and -sa/--split-audio contradict each other (mix into one vs. one file per track)." >&2
-    usage
-fi
+@dataclass
+class Gpu:
+    backend: str = ""
+    device: str = ""
 
-if [ "$NO_CONVERT" = true ] && [ -n "$BITS_OVERRIDE" ]; then
-    echo "Error: a forced bit depth cannot be used with --no-convert (audio is stream-copied untouched)." >&2
-    usage
-fi
 
-# If the combined name was given with a media extension, drop it. The extension
-# is always chosen by the script (.mov/.wav when converting, the first input's
-# extension when using --no-convert).
-if [ -n "$COMBINE_NAME" ] && has_media_ext "$COMBINE_NAME"; then
-    COMBINE_NAME="${COMBINE_NAME%.*}"
-fi
+@dataclass
+class Plan:
+    pre: list
+    inp: list
+    outputs: list  # list of (output_args, output_path); the first is the main output
 
-if [ "$#" -eq 0 ]; then
-    usage
-fi
 
-# --- Determine thread count once for the whole run ---
-THREAD_COUNT=1
-if command -v nproc >/dev/null 2>&1; then
-    THREAD_COUNT=$(nproc)
-elif command -v sysctl >/dev/null 2>&1; then
-    THREAD_COUNT=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
-fi
+# ---------------------------------------------------------------- logging ---
 
-# --- Detect a usable GPU decode backend, if -use-gpu=true was requested.
-#     Note: ffmpeg has no GPU encoder for DNxHR (it's an Avid codec, CPU-only
-#     in ffmpeg), so this only accelerates decoding the *source* file. The
-#     DNxHR encode - and -threads multithreading - still happen on the CPU
-#     regardless. Preference order below favors whichever backend is both
-#     compiled into this ffmpeg and has evidence of real hardware present. ---
-detect_gpu_hwaccel() {
-    local available candidate
-    available=$(ffmpeg -hide_banner -hwaccels 2>/dev/null | tail -n +2)
+class Logger:
+    _lock = threading.Lock()
 
-    for candidate in cuda vaapi qsv; do
-        if echo "$available" | grep -qx "$candidate"; then
-            case "$candidate" in
-                cuda)
-                    if command -v nvidia-smi >/dev/null 2>&1; then
-                        GPU_HWACCEL="cuda"
-                        return 0
-                    fi
-                    ;;
-                vaapi)
-                    if [ -e /dev/dri/renderD128 ]; then
-                        GPU_HWACCEL="vaapi"
-                        GPU_HWACCEL_DEVICE="/dev/dri/renderD128"
-                        return 0
-                    fi
-                    ;;
-                qsv)
-                    if [ -e /dev/dri/renderD128 ]; then
-                        GPU_HWACCEL="qsv"
-                        return 0
-                    fi
-                    ;;
-            esac
-        fi
-    done
-    return 1
-}
+    def __init__(self, path: Path, verbose: int, prefix: str = ""):
+        self.path = path
+        self.verbose = verbose
+        self.prefix = prefix
 
-if [ "$GPU_REQUESTED" = true ] && [ "$NO_CONVERT" != true ]; then
-    if detect_gpu_hwaccel; then
-        echo "GPU-accelerated decode enabled (backend: $GPU_HWACCEL). DNxHR encoding itself still runs on the CPU - ffmpeg has no GPU encoder for that codec." >&2
-    else
-        echo "Warning: -use-gpu=true requested, but no usable GPU decode backend was detected (checked cuda/vaapi/qsv). Falling back to CPU decoding." >&2
-    fi
-fi
+    def child(self, prefix: str) -> "Logger":
+        return Logger(self.path, self.verbose, prefix)
 
-# --- Resolve arguments into a concrete list of files ---
-declare -a FILES=()
-shopt -s nullglob
-for arg in "$@"; do
-    if [ -f "$arg" ]; then
-        FILES+=("$arg")
-    elif [[ "$arg" == *[\*\?\[]* ]]; then
-        declare -a MATCHES=($arg)
-        if [ "${#MATCHES[@]}" -gt 0 ]; then
-            FILES+=("${MATCHES[@]}")
-        else
-            echo "Warning: pattern '$arg' matched no files - skipping." >&2
-        fi
-    else
-        echo "Warning: file '$arg' not found - skipping." >&2
-    fi
-done
-shopt -u nullglob
+    def _emit(self, msg: str, to_terminal: bool) -> None:
+        line = f"{self.prefix}{msg}"
+        with Logger._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+            if to_terminal:
+                print(line, flush=True)
 
-if [ "${#FILES[@]}" -eq 0 ]; then
-    echo "Error: no valid input files found." >&2
-    exit 1
-fi
+    def log(self, msg: str) -> None:
+        self._emit(msg, self.verbose >= 1)
 
-TOTAL=${#FILES[@]}
+    def notify(self, msg: str) -> None:
+        self._emit(msg, True)
 
-if [ "$COMBINE" = true ]; then
-    if [ "$TOTAL" -lt 2 ]; then
-        echo "Error: -c/--combine needs at least 2 valid input files (found $TOTAL)." >&2
-        exit 1
-    fi
-    # Combining produces exactly one output, so concurrency does not apply.
-    JOBS=1
-fi
+    def append_raw(self, lines: list) -> None:
+        with Logger._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    for ln in lines:
+                        fh.write(ln + "\n")
+            except OSError:
+                pass
 
-# Scratch space for per-file status codes and the (tiny) concat list file.
-STATUS_DIR=$(mktemp -d)
-cleanup_status_dir() { rm -rf "$STATUS_DIR"; }
-trap cleanup_status_dir EXIT
 
-if ! touch "$LOG_FILE" 2>/dev/null; then
-    OLD_LOG_FILE="$LOG_FILE"
-    LOG_FILE="/tmp/tovinci.log"
-    echo "Warning: could not write to '$OLD_LOG_FILE', logging to '$LOG_FILE' instead." >&2
-    touch "$LOG_FILE" 2>/dev/null || true
-fi
+def setup_log_path() -> Path:
+    primary = Path(os.environ.get("HOME") or "/tmp") / "tovinci.log"
+    try:
+        primary.touch()
+        return primary
+    except OSError:
+        fallback = Path("/tmp/tovinci.log")
+        print(f"Warning: could not write to '{primary}', logging to '{fallback}' instead.",
+              file=sys.stderr)
+        try:
+            fallback.touch()
+        except OSError:
+            pass
+        return fallback
 
-on_unexpected_error() {
-    local exit_code=$?
-    echo "Error: '$(basename "$0")' failed unexpectedly (exit code $exit_code) while processing '$CURRENT_FILE'." >&2
-    echo "Details, if any were captured, are in the log: $LOG_FILE" >&2
-    exit "$exit_code"
-}
-trap on_unexpected_error ERR
 
-if [ -f "$LOG_FILE" ]; then
-    EXISTING_RUNS=$(grep -c "^${RUN_MARKER}" "$LOG_FILE" 2>/dev/null) || EXISTING_RUNS=0
-    if [ "$EXISTING_RUNS" -ge 3 ]; then
-        rm -f "$LOG_FILE"
-    fi
-fi
+def rotate_log(path: Path) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if sum(1 for ln in text.splitlines() if ln.startswith(RUN_MARKER)) >= 3:
+        try:
+            path.unlink()
+            path.touch()
+        except OSError:
+            pass
 
-# --- Logging helpers. When running multiple jobs concurrently, prefix with
-#     the current file so interleaved terminal/log output stays readable. ---
-line_prefix() {
-    if [ "$JOBS" -gt 1 ] && [ -n "${CURRENT_FILE:-}" ]; then
-        echo "[$(basename -- "$CURRENT_FILE")] "
-    fi
-}
 
-log() {
-    echo "$(line_prefix)$1" >> "$LOG_FILE"
-    if [ "$VERBOSE_LEVEL" -ge 1 ]; then
-        echo "$(line_prefix)$1"
-    fi
-}
+def tail_log(path: Path, n: int = 10) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
 
-notify() {
-    echo "$(line_prefix)$1" >> "$LOG_FILE"
-    echo "$(line_prefix)$1"
-}
 
-if [ "$COMBINE" = true ]; then
-    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: combine $TOTAL files ==="
-elif [ "$TOTAL" -eq 1 ]; then
-    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: '${FILES[0]}' ==="
-else
-    log "${RUN_MARKER} $(date '+%Y-%m-%d %H:%M:%S') :: $TOTAL files (jobs=$JOBS) ==="
-fi
+# ---------------------------------------------------------- small helpers ---
 
-# --- Portable file size helper (GNU stat vs BSD/macOS stat) ---
-get_file_size() {
-    stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
-}
+def ext_of(name: str) -> str:
+    return os.path.splitext(name)[1].lstrip(".").lower()
 
-# --- Runs ffmpeg with the given arguments (everything after "ffmpeg -y"),
-#     honoring the current -v/-vv verbosity level. ---
-run_ffmpeg_cmd() {
-    local status=0
-    if [ "$VERBOSE_LEVEL" -ge 2 ]; then
-        # -vv: stream everything ffmpeg prints, live, straight to the terminal and log.
-        ffmpeg -y "$@" 2>&1 | tee -a "$LOG_FILE" || status=$?
-    elif [ "$VERBOSE_LEVEL" -eq 1 ]; then
-        # -v: show ffmpeg's live progress line (frame/fps/q/size/time/bitrate/
-        # speed) updating in real time as it encodes, without the banner,
-        # input/output metadata dump, or stream-mapping noise. -stats is
-        # passed explicitly because ffmpeg otherwise suppresses that live
-        # progress output whenever stdout/stderr isn't a real terminal (e.g.
-        # piped through tee, as it is here).
-        ffmpeg -y -hide_banner -loglevel error -stats "$@" 2>&1 | tee -a "$LOG_FILE" || status=$?
-    else
-        # default: fully quiet, everything goes to the log only.
-        ffmpeg -y -loglevel error "$@" >> "$LOG_FILE" 2>&1 || status=$?
-    fi
-    return "$status"
-}
 
-# --- Prints the PCM codec to use for audio track $2 (0-based) of file $1.
-#     A forced depth (--bits / -t wav-N) wins. Otherwise the depth matches the
-#     source track: bits_per_raw_sample when the source reports it (PCM, FLAC,
-#     ALAC), else the sample format. Lossy sources (AAC, MP3, Opus, Vorbis...)
-#     decode to float and map to 16-bit, since more bits add size but no
-#     fidelity. 8-bit and 12/16-bit sources map to 16, 20/24 to 24, deeper to 32. ---
-pcm_codec_for_track() {
-    local file="$1" idx="$2" bits="" codec="" fmt="" raw="" key val
+def has_media_ext(arg: str) -> bool:
+    return "." in arg and ext_of(arg) in MEDIA_EXTS
 
-    if [ -n "$BITS_OVERRIDE" ]; then
-        echo "pcm_s${BITS_OVERRIDE}le"
+
+def is_image_ext(arg: str) -> bool:
+    return ext_of(arg) in IMAGE_EXTS
+
+
+def has_glob_chars(arg: str) -> bool:
+    return any(c in arg for c in "*?[")
+
+
+def looks_like_name(arg: str) -> bool:
+    """True if the argument after -c is the optional output name, not an input."""
+    if arg.startswith("-"):
+        return False
+    if os.path.isfile(arg):
+        return False
+    if has_glob_chars(arg):
+        return False
+    if has_media_ext(arg):
+        return False
+    return True
+
+
+def get_file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
         return 0
-    fi
 
-    while IFS='=' read -r key val; do
-        case "$key" in
-            codec_name) codec="$val" ;;
-            sample_fmt) fmt="$val" ;;
-            bits_per_raw_sample) raw="$val" ;;
-        esac
-    done < <(ffprobe -v error -select_streams "a:$idx" -show_entries stream=codec_name,sample_fmt,bits_per_raw_sample -of default=noprint_wrappers=1 "$file" 2>/dev/null || true)
 
-    if [[ "$raw" =~ ^[0-9]+$ ]] && [ "$raw" -gt 0 ]; then
-        if [ "$raw" -le 16 ]; then
-            bits=16
-        elif [ "$raw" -le 24 ]; then
-            bits=24
-        else
-            bits=32
-        fi
-    else
-        case "$fmt" in
-            u8|u8p|s16|s16p) bits=16 ;;
-            s32|s32p) bits=32 ;;
-            flt|fltp|dbl|dblp)
-                case "$codec" in
-                    pcm_f*) bits=32 ;;
-                    *) bits=16 ;;
-                esac
-                ;;
-            *) bits=16 ;;
-        esac
-    fi
+def temp_name(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    return f"{root}.partial{ext}"
 
-    echo "pcm_s${bits}le"
-}
 
-# --- Builds the audio codec arguments into AUDIO_CODEC_ARGS, matching the
-#     source depth per track (or the forced depth). Uses AUDIO_COUNT,
-#     INPUT_FILE and AUDIO_CODEC_ARGS from the calling process_one_file
-#     (bash dynamic scoping).
-#       $1 = "video" (output .mov may hold several audio tracks, so each gets
-#                     its own codec via -c:a:N)
-#            "audio" (single WAV stream)
-#     When tracks are mixed with -ca there is only one output stream, so the
-#     codec follows the first track. ---
-set_audio_codec_args() {
-    local kind="$1" i codec
-    AUDIO_CODEC_ARGS=()
+def natural_key(path: str) -> tuple:
+    """Sort key that orders numbers by value (clip 2 before clip 10)."""
+    parts = re.split(r"(\d+)", path)
+    return ([int(p) if i % 2 else p.casefold() for i, p in enumerate(parts)], path)
 
-    if [ "$kind" = "video" ] && [ "$AUDIO_COUNT" -gt 1 ] && [ "$COMBINE_AUDIO" != true ]; then
-        for ((i = 0; i < AUDIO_COUNT; i++)); do
-            codec=$(pcm_codec_for_track "$INPUT_FILE" "$i")
-            AUDIO_CODEC_ARGS+=("-c:a:$i" "$codec")
-        done
-    else
-        codec=$(pcm_codec_for_track "$INPUT_FILE" 0)
-        AUDIO_CODEC_ARGS=(-c:a "$codec")
-    fi
 
-    if [ -n "$BITS_OVERRIDE" ]; then
-        log "Audio bit depth forced to ${BITS_OVERRIDE}-bit: ${AUDIO_CODEC_ARGS[*]}"
-    else
-        log "Audio bit depth matched to source: ${AUDIO_CODEC_ARGS[*]}"
-    fi
-}
+def order_for_combine(files: list, opts: Options, logger: "Logger") -> list:
+    """Natural-sort the clips unless --keep-order was given. Shell globs sort as
+    plain text (1, 10, 2, ...), which would put clip 10 right after clip 1."""
+    if opts.keep_order:
+        return files
+    ordered = sorted(files, key=natural_key)
+    if ordered != files:
+        logger.notify("Note: clips were reordered into natural order (1, 2, ... 10) instead of the order "
+                      "received. Use --keep-order to combine in exactly the order given.")
+    return ordered
 
-# --- Builds the audio stream selection for the output, into AUDIO_SEL_ARGS.
-#     Uses AUDIO_COUNT and INPUT_FILE from the calling process_one_file
-#     (bash dynamic scoping).
-#       $1 = "video" (output container can hold several audio tracks)
-#            "audio" (output is a WAV, which can only hold one stream)
-#     Default behavior keeps every audio track separate (e.g. mic + game
-#     audio). With -ca/--combine-audio all tracks are mixed into one stereo
-#     track instead. ---
-build_audio_args() {
-    local kind="$1" i filt="" channels
-    AUDIO_SEL_ARGS=()
 
-    if [ "$AUDIO_COUNT" -gt 1 ]; then
-        if [ "$COMBINE_AUDIO" = true ]; then
-            for ((i = 0; i < AUDIO_COUNT; i++)); do
-                filt+="[0:a:$i]"
-            done
-            # normalize=0 keeps each track at its original level instead of
-            # dividing the volume by the number of inputs.
-            filt+="amix=inputs=${AUDIO_COUNT}:duration=longest:normalize=0[aout]"
-            log "Combine-audio enabled. Mixing $AUDIO_COUNT audio tracks into one stereo track."
-            AUDIO_SEL_ARGS=(-filter_complex "$filt" -map "[aout]" -ac 2)
-        elif [ "$kind" = "video" ]; then
-            log "$AUDIO_COUNT audio tracks detected. Keeping them as separate tracks (use -ca to mix them into one)."
-            AUDIO_SEL_ARGS=(-map 0:a)
-        else
-            echo "Warning: '$INPUT_FILE' has $AUDIO_COUNT audio tracks but WAV output holds only one. Using the first track (use -ca to mix them all, or -sa to write one WAV per track)." >&2
-            log "Audio-only output holds a single stream. Using the first of $AUDIO_COUNT audio tracks."
-            AUDIO_SEL_ARGS=(-map 0:a:0)
-        fi
-    else
-        AUDIO_SEL_ARGS=(-map 0:a:0)
-        if [ "$COMBINE_AUDIO" = true ]; then
-            channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=nk=1:nw=1 "$INPUT_FILE" 2>/dev/null || true)
-            if [[ "$channels" =~ ^[0-9]+$ ]] && [ "$channels" -gt 2 ]; then
-                log "Combine-audio enabled. Downmixing $channels channels to stereo."
-                AUDIO_SEL_ARGS+=(-ac 2)
-            else
-                log "Combine-audio enabled, but there is only one audio track with $channels channel(s). Nothing to mix."
-            fi
-        fi
-    fi
-}
+def discard(paths: list) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
-# --- Appends one extra WAV output per audio track to EXTRA_OUT_ARGS (and the
-#     file names to EXTRA_OUT_FILES), starting at track index $1, named
-#     <stem>_a1.wav, <stem>_a2.wav, ... Uses AUDIO_COUNT, INPUT_FILE,
-#     EXTRA_OUT_ARGS and EXTRA_OUT_FILES from the calling process_one_file
-#     (dynamic scoping). Each extra output is its own ffmpeg output in the
-#     same single pass, and each track gets the PCM depth of its own source
-#     track (or the forced depth). ---
-build_split_outputs() {
-    local start="$1" stem="$2" i wav codec
-    for ((i = start; i < AUDIO_COUNT; i++)); do
-        wav="${stem}_a$((i + 1)).wav"
-        codec=$(pcm_codec_for_track "$INPUT_FILE" "$i")
-        log "Split track $((i + 1)) -> '$wav' ($codec)"
-        EXTRA_OUT_ARGS+=(-map "0:a:$i" -c:a "$codec" "$wav")
-        EXTRA_OUT_FILES+=("$wav")
-    done
-}
 
-# process_one_file INPUT [OUTPUT_STEM] [CONCAT_LIST] [SIZE_OVERRIDE]
-#   INPUT         file to analyze (in combine mode: the first clip, used for probing)
-#   OUTPUT_STEM   optional output name without extension (default: <name>_davinci)
-#   CONCAT_LIST   optional ffmpeg concat list; when set, ffmpeg reads the combined
-#                 clips from it instead of INPUT, in a single pass
-#   SIZE_OVERRIDE optional total input size in bytes (for the 10GB threading check)
-process_one_file() {
-    local INPUT_FILE="$1"
-    local OUTPUT_STEM_OVERRIDE="${2:-}"
-    local CONCAT_LIST="${3:-}"
-    local SIZE_OVERRIDE="${4:-}"
-    CURRENT_FILE="$INPUT_FILE"
+def quote_for_concat(path: str) -> str:
+    return path.replace("'", "'\\''")
 
-    log "Analyzing '$INPUT_FILE'..."
 
-    local FILENAME EXTENSION BASENAME EXT_LOWER IS_IMAGE OUTPUT_FILE OUTPUT_STEM FILE_SIZE USE_THREADS AUDIO_COUNT
-    local -a FFMPEG_ARGS FFMPEG_PRE_ARGS FFMPEG_IN_ARGS AUDIO_SEL_ARGS AUDIO_CODEC_ARGS EXTRA_OUT_ARGS EXTRA_OUT_FILES
-    FFMPEG_PRE_ARGS=()
-    AUDIO_SEL_ARGS=()
-    AUDIO_CODEC_ARGS=()
-    EXTRA_OUT_ARGS=()
-    EXTRA_OUT_FILES=()
-    FILENAME=$(basename -- "$INPUT_FILE")
-    EXTENSION="${FILENAME##*.}"
-    BASENAME="${FILENAME%.*}"
-    EXT_LOWER=$(echo "$EXTENSION" | tr '[:upper:]' '[:lower:]')
+def video_ext(opts: Options) -> str:
+    """Container extension for converted video output."""
+    return "mp4" if opts.target_type == "mp4" else "mov"
 
-    OUTPUT_STEM="${BASENAME}_davinci"
-    if [ -n "$OUTPUT_STEM_OVERRIDE" ]; then
-        OUTPUT_STEM="$OUTPUT_STEM_OVERRIDE"
-    fi
 
-    if [ -n "$CONCAT_LIST" ]; then
-        log "Combined input: stream settings are probed from '$INPUT_FILE', clips are read via concat list."
-        FFMPEG_IN_ARGS=(-f concat -safe 0 -i "$CONCAT_LIST")
-    else
-        FFMPEG_IN_ARGS=(-i "$INPUT_FILE")
-    fi
+# ----------------------------------------------------------------- probing ---
 
-    IS_IMAGE=false
-    case "$EXT_LOWER" in
-        jpg|jpeg|png|bmp|gif|tif|tiff|webp|heic|heif|exr|dpx|psd|tga|jp2)
-            IS_IMAGE=true
-            ;;
-    esac
+def ffprobe(*args: str) -> str:
+    try:
+        res = subprocess.run(["ffprobe", "-v", "error", *args],
+                             capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise ToolError("ffprobe was not found in PATH.")
+    return res.stdout.strip() if res.returncode == 0 else ""
 
-    if [ -n "$SIZE_OVERRIDE" ]; then
-        FILE_SIZE="$SIZE_OVERRIDE"
-    else
-        FILE_SIZE=$(get_file_size "$INPUT_FILE")
-    fi
-    USE_THREADS=false
-    if [ "$THREADED" = true ] || [ "$FILE_SIZE" -ge "$AUTO_THREAD_BYTES" ]; then
-        USE_THREADS=true
-    fi
 
-    # Number of audio streams (tracks) in the source, e.g. 2 when a recording
-    # has separate mic and desktop-audio tracks.
-    AUDIO_COUNT=0
-    if [ "$IS_IMAGE" != true ]; then
-        AUDIO_COUNT=$({ ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$INPUT_FILE" 2>/dev/null || true; } | wc -l | tr -d ' ')
-    fi
+def probe_value(path: str, stream: str, entries: str) -> str:
+    return ffprobe("-select_streams", stream, "-show_entries", f"stream={entries}",
+                   "-of", "default=nk=1:nw=1", path)
 
-    FFMPEG_ARGS=()
 
-    if [ "$IS_IMAGE" = true ]; then
-        log "Image file detected. Automagically configuring for DaVinci Resolve image compatibility..."
-        OUTPUT_FILE="${OUTPUT_STEM}.jpg"
-        log "Converting to high-quality JPEG..."
-        FFMPEG_ARGS=(-pix_fmt yuvj420p -q:v 2 -update 1)
-        # Single-frame encode - threading doesn't help here, so it's skipped
-        # even if USE_THREADS is true.
+def count_audio(path: str) -> int:
+    out = ffprobe("-select_streams", "a", "-show_entries", "stream=index",
+                  "-of", "csv=p=0", path)
+    return len([ln for ln in out.splitlines() if ln.strip()])
 
-    elif [ "$TARGET_TYPE" = "wav" ]; then
-        # User has explicitly told us to treat this as audio-only, so skip
-        # video-stream detection entirely - it doesn't matter whether ffprobe
-        # sees a "video" stream (e.g. embedded cover art in an mp3).
-        local HAS_AUDIO
-        HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
 
-        if [ "$HAS_AUDIO" != "audio" ]; then
-            echo "Error: -t wav specified but no audio stream found in '$INPUT_FILE'." >&2
-            return 1
-        fi
+def stream_signature(path: str) -> str:
+    video = ffprobe("-select_streams", "v:0", "-show_entries",
+                    "stream=codec_name,width,height,pix_fmt,r_frame_rate", "-of", "csv=p=0", path)
+    audio = ffprobe("-select_streams", "a", "-show_entries",
+                    "stream=codec_name,sample_rate,channels", "-of", "csv=p=0", path)
+    return video + "\n" + audio
 
-        log "Forced audio-only mode (-t wav). Automagically configuring for DaVinci Resolve Linux audio compatibility..."
-        OUTPUT_FILE="${OUTPUT_STEM}.wav"
-        set_audio_codec_args audio
-        if [ "$SPLIT_AUDIO" = true ] && [ "$AUDIO_COUNT" -gt 1 ]; then
-            log "Split-audio enabled. Writing each of the $AUDIO_COUNT audio tracks as its own WAV."
-            OUTPUT_FILE="${OUTPUT_STEM}_a1.wav"
-            FFMPEG_ARGS=(-vn -map 0:a:0 "${AUDIO_CODEC_ARGS[@]}")
-            build_split_outputs 1 "$OUTPUT_STEM"
-        else
-            build_audio_args audio
-            # -vn drops any video/attached-picture stream so it doesn't get
-            # dragged along and rejected by the WAV muxer.
-            FFMPEG_ARGS=(-vn "${AUDIO_SEL_ARGS[@]}" "${AUDIO_CODEC_ARGS[@]}")
-        fi
-        # PCM audio encoding is not thread-parallelizable in ffmpeg, so
-        # -threads is not applied here even if USE_THREADS is true.
 
-    else
-        local HAS_VIDEO HAS_AUDIO PIX_FMT
+def pcm_codec_for_track(path: str, idx: int, bits_override: str | None) -> str:
+    """PCM codec for audio track idx: forced depth wins, else match the source.
 
-        HAS_VIDEO=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
-        HAS_AUDIO=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nk=1:nw=1 "$INPUT_FILE")
+    Lossy sources (AAC, MP3, Opus, Vorbis...) decode to float and map to 16-bit.
+    """
+    if bits_override:
+        return f"pcm_s{bits_override}le"
 
-        if [ -z "$HAS_VIDEO" ] && [ "$HAS_AUDIO" = "audio" ]; then
-            log "Sole audio file detected. Automagically configuring for DaVinci Resolve Linux audio compatibility..."
-            OUTPUT_FILE="${OUTPUT_STEM}.wav"
-            set_audio_codec_args audio
-            if [ "$SPLIT_AUDIO" = true ] && [ "$AUDIO_COUNT" -gt 1 ]; then
-                log "Split-audio enabled. Writing each of the $AUDIO_COUNT audio tracks as its own WAV."
-                OUTPUT_FILE="${OUTPUT_STEM}_a1.wav"
-                FFMPEG_ARGS=(-map 0:a:0 "${AUDIO_CODEC_ARGS[@]}")
-                build_split_outputs 1 "$OUTPUT_STEM"
-            else
-                build_audio_args audio
-                FFMPEG_ARGS=("${AUDIO_SEL_ARGS[@]}" "${AUDIO_CODEC_ARGS[@]}")
-            fi
-        else
-            OUTPUT_FILE="${OUTPUT_STEM}.mov"
+    info = {}
+    out = ffprobe("-select_streams", f"a:{idx}", "-show_entries",
+                  "stream=codec_name,sample_fmt,bits_per_raw_sample",
+                  "-of", "default=noprint_wrappers=1", path)
+    for line in out.splitlines():
+        if "=" in line:
+            key, val = line.split("=", 1)
+            info[key] = val
+    codec = info.get("codec_name", "")
+    fmt = info.get("sample_fmt", "")
+    raw = info.get("bits_per_raw_sample", "")
 
-            PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nk=1:nw=1 "$INPUT_FILE")
-            log "Detected source pixel format: $PIX_FMT"
+    if raw.isdigit() and int(raw) > 0:
+        raw_bits = int(raw)
+        bits = 16 if raw_bits <= 16 else 24 if raw_bits <= 24 else 32
+    elif fmt in ("u8", "u8p", "s16", "s16p"):
+        bits = 16
+    elif fmt in ("s32", "s32p"):
+        bits = 32
+    elif fmt in ("flt", "fltp", "dbl", "dblp"):
+        bits = 32 if codec.startswith("pcm_f") else 16
+    else:
+        bits = 16
+    return f"pcm_s{bits}le"
 
-            # -map 0:v:0 picks the first video stream explicitly; audio streams
-            # are selected below so no track is silently dropped.
-            if [[ "$PIX_FMT" == *"10"* || "$PIX_FMT" == *"12"* || "$PIX_FMT" == *"le"* ]]; then
-                log "High bit-depth detected. Transcoding to 10-bit DNxHR HQX..."
-                FFMPEG_ARGS=(-map 0:v:0 -c:v dnxhd -profile:v dnxhr_hqx -pix_fmt yuv422p10le)
-            else
-                log "Standard bit-depth detected. Transcoding to 8-bit DNxHR HQ..."
-                FFMPEG_ARGS=(-map 0:v:0 -c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p)
-            fi
 
-            if [ "$USE_THREADS" = true ]; then
-                if [ "$THREADED" = true ]; then
-                    log "Threaded mode forced (--threaded). Using $THREAD_COUNT encoder threads."
-                else
-                    log "File size ($FILE_SIZE bytes) exceeds 10GB threshold. Automagically enabling $THREAD_COUNT encoder threads..."
-                fi
-                FFMPEG_ARGS+=(-threads "$THREAD_COUNT")
-            fi
+# ------------------------------------------------------------- audio args ---
 
-            if [ -n "$GPU_HWACCEL" ]; then
-                log "Using GPU-accelerated ($GPU_HWACCEL) decode for the source file. Encode + threading above still run on CPU."
-                case "$GPU_HWACCEL" in
-                    cuda)
-                        FFMPEG_PRE_ARGS=(-hwaccel cuda)
-                        ;;
-                    vaapi)
-                        FFMPEG_PRE_ARGS=(-vaapi_device "$GPU_HWACCEL_DEVICE" -hwaccel vaapi)
-                        ;;
-                    qsv)
-                        FFMPEG_PRE_ARGS=(-hwaccel qsv)
-                        ;;
-                esac
-            fi
+def set_audio_codec_args(kind: str, path: str, audio_count: int, opts: Options, log) -> list:
+    """Codec args matching the source depth per track (or the forced depth).
 
-            if [ "$HAS_AUDIO" = "audio" ]; then
-                if [ "$SPLIT_AUDIO" = true ] && [ "$AUDIO_COUNT" -gt 1 ]; then
-                    log "Split-audio enabled. Video-only .mov plus one WAV per audio track ($AUDIO_COUNT tracks)."
-                    FFMPEG_ARGS+=(-an)
-                    build_split_outputs 0 "$OUTPUT_STEM"
-                else
-                    log "Audio stream detected. Retaining uncompressed audio."
-                    build_audio_args video
-                    set_audio_codec_args video
-                    FFMPEG_ARGS+=("${AUDIO_SEL_ARGS[@]}" "${AUDIO_CODEC_ARGS[@]}")
-                fi
-            else
-                log "No audio stream detected. Stripping audio track."
-                FFMPEG_ARGS+=(-an)
-            fi
-        fi
-    fi
+    mp4 video output uses AAC instead, since PCM does not belong in an mp4.
+    """
+    if kind == "video" and opts.target_type == "mp4":
+        args = ["-c:a", "aac", "-b:a", MP4_AUDIO_BITRATE]
+        log(f"mp4 output uses AAC audio at {MP4_AUDIO_BITRATE}: {' '.join(args)}")
+        return args
 
-    log "Running FFmpeg command..."
-    log "ffmpeg ${FFMPEG_PRE_ARGS[*]} ${FFMPEG_IN_ARGS[*]} ${FFMPEG_ARGS[*]} \"$OUTPUT_FILE\" ${EXTRA_OUT_ARGS[*]}"
-    log "--------------------------------------------------------"
+    if kind == "video" and audio_count > 1 and not opts.combine_audio:
+        args = []
+        for i in range(audio_count):
+            args += [f"-c:a:{i}", pcm_codec_for_track(path, i, opts.bits)]
+    else:
+        args = ["-c:a", pcm_codec_for_track(path, 0, opts.bits)]
 
-    local FFMPEG_STATUS=0
-    run_ffmpeg_cmd "${FFMPEG_PRE_ARGS[@]}" "${FFMPEG_IN_ARGS[@]}" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" "${EXTRA_OUT_ARGS[@]}" || FFMPEG_STATUS=$?
+    if opts.bits:
+        log(f"Audio bit depth forced to {opts.bits}-bit: {' '.join(args)}")
+    else:
+        log(f"Audio bit depth matched to source: {' '.join(args)}")
+    return args
 
-    if [ "$FFMPEG_STATUS" -ne 0 ] && [ "${#FFMPEG_PRE_ARGS[@]}" -gt 0 ]; then
-        # GPU-accelerated decode failed (unsupported source codec, no actual
-        # hardware behind the reported backend, driver issue, etc). Fall back
-        # to CPU decode and retry once before giving up on this file.
-        log "GPU-accelerated decode failed (exit code $FFMPEG_STATUS) for '$INPUT_FILE'. Retrying with CPU decode..."
-        FFMPEG_PRE_ARGS=()
-        FFMPEG_STATUS=0
-        run_ffmpeg_cmd "${FFMPEG_IN_ARGS[@]}" "${FFMPEG_ARGS[@]}" "$OUTPUT_FILE" "${EXTRA_OUT_ARGS[@]}" || FFMPEG_STATUS=$?
-    fi
 
-    if [ "$FFMPEG_STATUS" -ne 0 ]; then
-        trap - ERR
-        echo "Error: ffmpeg failed (exit code $FFMPEG_STATUS) while processing '$INPUT_FILE'." >&2
-        if [ "$VERBOSE_LEVEL" -lt 2 ]; then
-            echo "Last few lines of ffmpeg output:" >&2
-            tail -n 10 "$LOG_FILE" >&2
-        fi
-        echo "Full details: $LOG_FILE" >&2
-        return "$FFMPEG_STATUS"
-    fi
+def build_audio_args(kind: str, path: str, audio_count: int, opts: Options, log) -> list:
+    """Audio stream selection. Default keeps tracks separate, -ca mixes them."""
+    if audio_count > 1:
+        if opts.combine_audio:
+            filt = "".join(f"[0:a:{i}]" for i in range(audio_count))
+            # normalize=0 keeps each track at its original level.
+            filt += f"amix=inputs={audio_count}:duration=longest:normalize=0[aout]"
+            log(f"Combine-audio enabled. Mixing {audio_count} audio tracks into one stereo track.")
+            return ["-filter_complex", filt, "-map", "[aout]", "-ac", "2"]
+        if kind == "video":
+            log(f"{audio_count} audio tracks detected. Keeping them as separate tracks (use -ca to mix them into one).")
+            return ["-map", "0:a"]
+        print(f"Warning: '{path}' has {audio_count} audio tracks but WAV output holds only one. "
+              "Using the first track (use -ca to mix them all, or -sa to write one WAV per track).",
+              file=sys.stderr)
+        log(f"Audio-only output holds a single stream. Using the first of {audio_count} audio tracks.")
+        return ["-map", "0:a:0"]
 
-    log "--------------------------------------------------------"
-    notify "Done! Highly compatible file created: '$OUTPUT_FILE'"
-    local extra
-    for extra in "${EXTRA_OUT_FILES[@]}"; do
-        notify "Done! Separate audio track created: '$extra'"
-    done
+    args = ["-map", "0:a:0"]
+    if opts.combine_audio:
+        channels = ffprobe("-select_streams", "a:0", "-show_entries", "stream=channels",
+                           "-of", "default=nk=1:nw=1", path)
+        if channels.isdigit() and int(channels) > 2:
+            log(f"Combine-audio enabled. Downmixing {channels} channels to stereo.")
+            args += ["-ac", "2"]
+        else:
+            log(f"Combine-audio enabled, but there is only one audio track with {channels} channel(s). Nothing to mix.")
+    return args
+
+
+def build_split_outputs(start: int, stem: str, path: str, audio_count: int,
+                        opts: Options, log) -> list:
+    """One extra WAV output per audio track, named <stem>_a1.wav, <stem>_a2.wav, ..."""
+    outputs = []
+    for i in range(start, audio_count):
+        wav = f"{stem}_a{i + 1}.wav"
+        codec = pcm_codec_for_track(path, i, opts.bits)
+        log(f"Split track {i + 1} -> '{wav}' ({codec})")
+        outputs.append((["-map", f"0:a:{i}", "-c:a", codec], wav))
+    return outputs
+
+
+# ------------------------------------------------------------------- GPU ---
+
+def detect_gpu() -> Gpu | None:
+    """Pick a usable GPU decode backend. ffmpeg has no GPU DNxHR encoder, so this
+    only speeds up decoding the source; the encode stays on the CPU."""
+    try:
+        res = subprocess.run(["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True,
+                             text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None
+    available = {ln.strip() for ln in res.stdout.splitlines()[1:]}
+    render_node = "/dev/dri/renderD128"
+    if "cuda" in available and shutil.which("nvidia-smi"):
+        return Gpu("cuda")
+    if "vaapi" in available and os.path.exists(render_node):
+        return Gpu("vaapi", render_node)
+    if "qsv" in available and os.path.exists(render_node):
+        return Gpu("qsv")
+    return None
+
+
+# -------------------------------------------------------------- planning ---
+
+def build_plan(input_file: str, stem: str | None, opts: Options, gpu: Gpu | None, log,
+               concat_list: str | None = None, size_override: int | None = None) -> Plan:
+    """Probe input_file and work out the ffmpeg arguments and output files."""
+    log(f"Analyzing '{input_file}'...")
+
+    if stem is None:
+        stem = f"{os.path.splitext(os.path.basename(input_file))[0]}_davinci"
+
+    pre: list = []
+    if concat_list:
+        log(f"Combined input: stream settings are probed from '{input_file}', clips are read via concat list.")
+        inp = ["-f", "concat", "-safe", "0", "-i", concat_list]
+    else:
+        inp = ["-i", input_file]
+
+    is_image = ext_of(input_file) in IMAGE_EXTS
+    file_size = size_override if size_override is not None else get_file_size(input_file)
+    use_threads = opts.threaded or file_size >= AUTO_THREAD_BYTES
+    thread_count = os.cpu_count() or 1
+    audio_count = 0 if is_image else count_audio(input_file)
+
+    if is_image:
+        log("Image file detected. Automagically configuring for DaVinci Resolve image compatibility...")
+        log("Converting to high-quality JPEG...")
+        # Single-frame encode: threading does not help here.
+        return Plan(pre, inp, [(["-pix_fmt", "yuvj420p", "-q:v", "2", "-update", "1"], f"{stem}.jpg")])
+
+    if opts.target_type == "wav":
+        # Explicit audio-only: ignore any video stream (e.g. cover art in an mp3).
+        if probe_value(input_file, "a:0", "codec_type") != "audio":
+            raise ToolError(f"-t wav specified but no audio stream found in '{input_file}'.")
+        log("Forced audio-only mode (-t wav). Automagically configuring for DaVinci Resolve Linux audio compatibility...")
+        return Plan(pre, inp, audio_only_outputs(input_file, stem, audio_count, opts, log, drop_video=True))
+
+    has_video = probe_value(input_file, "v:0", "codec_type")
+    has_audio = probe_value(input_file, "a:0", "codec_type")
+
+    if not has_video and has_audio == "audio":
+        if opts.target_type in ("mp4", "prores"):
+            log(f"No video stream in '{input_file}', so the -t {opts.target_type} video type does not apply. Writing WAV instead.")
+        log("Sole audio file detected. Automagically configuring for DaVinci Resolve Linux audio compatibility...")
+        return Plan(pre, inp, audio_only_outputs(input_file, stem, audio_count, opts, log, drop_video=False))
+
+    pix_fmt = probe_value(input_file, "v:0", "pix_fmt")
+    log(f"Detected source pixel format: {pix_fmt}")
+
+    if opts.target_type == "mp4":
+        crf = MP4_CRF_SMALL if opts.quality == "small" else MP4_CRF
+        log(f"Transcoding to H.264 (CRF {crf}) in an mp4 container...")
+        args = ["-map", "0:v:0", "-c:v", "libx264", "-preset", "medium", "-crf", crf,
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    elif opts.target_type == "prores":
+        number, label = PRORES_PROFILES[opts.quality or "hq"]
+        log(f"Transcoding to {label} (10-bit 4:2:2) in a mov container...")
+        args = ["-map", "0:v:0", "-c:v", "prores_ks", "-profile:v", number, "-vendor", "apl0",
+                "-pix_fmt", "yuv422p10le"]
+    elif "10" in pix_fmt or "12" in pix_fmt or "le" in pix_fmt:
+        log("High bit-depth detected. Transcoding to 10-bit DNxHR HQX...")
+        args = ["-map", "0:v:0", "-c:v", "dnxhd", "-profile:v", "dnxhr_hqx", "-pix_fmt", "yuv422p10le"]
+    else:
+        log("Standard bit-depth detected. Transcoding to 8-bit DNxHR HQ...")
+        args = ["-map", "0:v:0", "-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]
+
+    if use_threads:
+        if opts.threaded:
+            log(f"Threaded mode forced (--threaded). Using {thread_count} encoder threads.")
+        else:
+            log(f"File size ({file_size} bytes) exceeds 10GB threshold. Automagically enabling {thread_count} encoder threads...")
+        args += ["-threads", str(thread_count)]
+
+    if gpu is not None:
+        log(f"Using GPU-accelerated ({gpu.backend}) decode for the source file. Encode + threading above still run on CPU.")
+        if gpu.backend == "cuda":
+            pre = ["-hwaccel", "cuda"]
+        elif gpu.backend == "vaapi":
+            pre = ["-vaapi_device", gpu.device, "-hwaccel", "vaapi"]
+        elif gpu.backend == "qsv":
+            pre = ["-hwaccel", "qsv"]
+
+    extras: list = []
+    if has_audio == "audio":
+        if opts.split_audio and audio_count > 1:
+            log(f"Split-audio enabled. Video-only .{video_ext(opts)} plus one WAV per audio track ({audio_count} tracks).")
+            args.append("-an")
+            extras = build_split_outputs(0, stem, input_file, audio_count, opts, log)
+        else:
+            if opts.target_type == "mp4":
+                log("Audio stream detected. Encoding it as AAC.")
+            else:
+                log("Audio stream detected. Retaining uncompressed audio.")
+            sel = build_audio_args("video", input_file, audio_count, opts, log)
+            codec = set_audio_codec_args("video", input_file, audio_count, opts, log)
+            args += sel + codec
+    else:
+        log("No audio stream detected. Stripping audio track.")
+        args.append("-an")
+
+    return Plan(pre, inp, [(args, f"{stem}.{video_ext(opts)}")] + extras)
+
+
+def audio_only_outputs(input_file: str, stem: str, audio_count: int, opts: Options, log,
+                       drop_video: bool) -> list:
+    """Outputs for audio-only conversion. -vn drops attached pictures that the WAV muxer rejects."""
+    vn = ["-vn"] if drop_video else []
+    codec = set_audio_codec_args("audio", input_file, audio_count, opts, log)
+    if opts.split_audio and audio_count > 1:
+        log(f"Split-audio enabled. Writing each of the {audio_count} audio tracks as its own WAV.")
+        main = (vn + ["-map", "0:a:0"] + codec, f"{stem}_a1.wav")
+        return [main] + build_split_outputs(1, stem, input_file, audio_count, opts, log)
+    sel = build_audio_args("audio", input_file, audio_count, opts, log)
+    return [(vn + sel + codec, f"{stem}.wav")]
+
+
+# ------------------------------------------------------------- execution ---
+
+def run_ffmpeg(args: list, opts: Options, logger: Logger) -> int:
+    """Run ffmpeg honoring -v/-vv. -nostdin stops stray keypresses from reaching ffmpeg."""
+    base = ["ffmpeg", "-y", "-nostdin"]
+    if opts.verbose >= 2:
+        pass  # full live output
+    elif opts.verbose == 1:
+        # -stats is explicit because ffmpeg hides live progress when output is piped.
+        base += ["-hide_banner", "-loglevel", "error", "-stats"]
+    else:
+        base += ["-loglevel", "error"]
+    cmd = base + args
+
+    try:
+        if opts.verbose == 0:
+            with open(logger.path, "a", encoding="utf-8") as fh:
+                return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=fh,
+                                      stderr=subprocess.STDOUT).returncode
+
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=0)
+    except FileNotFoundError:
+        raise ToolError("ffmpeg was not found in PATH.")
+
+    fd = proc.stdout.fileno()
+    buf = ""
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", "replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            buf += text
+            *lines, buf = buf.split("\n")
+            # Progress updates use \r; the log keeps only the last one per line.
+            logger.append_raw([ln.rsplit("\r", 1)[-1] for ln in lines])
+        if buf:
+            logger.append_raw([buf.rsplit("\r", 1)[-1]])
+        return proc.wait()
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
+
+
+def encode(plan: Plan, opts: Options, logger: Logger, label: str, use_temp: bool) -> int:
+    """Run one ffmpeg pass for a plan. With use_temp, outputs are written as
+    <name>.partial<ext> and only renamed once ffmpeg succeeds, so an interrupted
+    run never leaves something that looks finished."""
+    finals = [p for _, p in plan.outputs]
+    targets = [temp_name(p) for p in finals] if use_temp else finals
+
+    def assemble(pre: list) -> list:
+        args = list(pre) + list(plan.inp)
+        for (oargs, _), target in zip(plan.outputs, targets):
+            args += list(oargs) + [target]
+        return args
+
+    logger.log("Running FFmpeg command...")
+    logger.log(shlex.join(["ffmpeg"] + assemble(plan.pre)))
+    logger.log(RULE)
+
+    try:
+        status = run_ffmpeg(assemble(plan.pre), opts, logger)
+        if status != 0 and plan.pre:
+            # GPU decode failed (unsupported codec, driver issue...). Retry once on CPU.
+            logger.log(f"GPU-accelerated decode failed (exit code {status}) for '{label}'. Retrying with CPU decode...")
+            status = run_ffmpeg(assemble([]), opts, logger)
+    except BaseException:
+        if use_temp:
+            discard(targets)
+        raise
+
+    if status != 0:
+        if use_temp:
+            discard(targets)
+        print(f"Error: ffmpeg failed (exit code {status}) while processing '{label}'.", file=sys.stderr)
+        if opts.verbose < 2:
+            print("Last few lines of ffmpeg output:", file=sys.stderr)
+            print(tail_log(logger.path), file=sys.stderr)
+        print(f"Full details: {logger.path}", file=sys.stderr)
+        return status
+
+    logger.log(RULE)
+    if use_temp:
+        for tmp, final in zip(targets, finals):
+            os.replace(tmp, final)
     return 0
-}
 
-# --- Resolves a path to an absolute path (needed for the concat list file) ---
-abs_path() {
-    local d b
-    d=$(cd "$(dirname -- "$1")" && pwd) || return 1
-    b=$(basename -- "$1")
-    printf '%s/%s' "$d" "$b"
-}
 
-# --- Describes the stream layout of a file (the first video stream and ALL
-#     audio streams) so clips can be checked for compatibility before they are
-#     concatenated. ---
-stream_signature() {
-    ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,pix_fmt,r_frame_rate -of csv=p=0 "$1" 2>/dev/null || true
-    ffprobe -v error -select_streams a -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 "$1" 2>/dev/null || true
-}
+def announce_outputs(plan: Plan, logger: Logger) -> None:
+    logger.notify(f"Done! Highly compatible file created: '{plan.outputs[0][1]}'")
+    for _, path in plan.outputs[1:]:
+        logger.notify(f"Done! Separate audio track created: '{path}'")
 
-# --- Combine mode: merge all FILES into one video. Unless --no-convert is set,
-#     the merged result is converted to the DaVinci format in the same single
-#     ffmpeg pass (no large intermediate file is written). ---
-run_combine() {
-    local f cand first_file first_name first_ext stem out list_file p esc sq size sig ref_sig total_size
-    local -a CANDIDATES
-    first_file="${FILES[0]}"
-    CURRENT_FILE="$first_file"
-    first_name=$(basename -- "$first_file")
-    first_ext="${first_name##*.}"
 
-    # Images can't be combined into a video.
-    for f in "${FILES[@]}"; do
-        if is_image_ext "$f"; then
-            echo "Error: -c/--combine only supports video/audio files, but '$f' is an image." >&2
+# ----------------------------------------------------------- resume state ---
+
+def job_key(inputs: list, stem: str, opts: Options) -> str:
+    items = []
+    for f in inputs:
+        st = os.stat(f)
+        items.append([os.path.abspath(f), st.st_size, st.st_mtime_ns])
+    payload = json.dumps({
+        "inputs": items,
+        "stem": os.path.abspath(stem),
+        "opts": {"bits": opts.bits, "ca": opts.combine_audio, "sa": opts.split_audio,
+                 "t": opts.target_type, "q": opts.quality, "nc": opts.no_convert},
+        "v": 1,
+    }, sort_keys=True)
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def state_root(opts: Options) -> Path:
+    """Directory for resume data. Never allowed under /mnt/Data."""
+    if opts.work_dir is not None:
+        root = opts.work_dir.expanduser()
+    else:
+        base = os.environ.get("XDG_CACHE_HOME")
+        root = (Path(base) if base else Path.home() / ".cache") / "tovinci"
+    real = os.path.realpath(root)
+    if real == FORBIDDEN_CACHE_ROOT or real.startswith(FORBIDDEN_CACHE_ROOT + os.sep):
+        raise ToolError(f"resume data must not live under {FORBIDDEN_CACHE_ROOT} (got '{root}'). "
+                        "Use --work-dir to pick a location on the primary drive.")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ToolError(f"could not create work directory '{root}': {exc}")
+    return root
+
+
+def note_work_dir(root: Path, logger: Logger) -> None:
+    try:
+        free = shutil.disk_usage(root).free / (1024 ** 3)
+        logger.notify(f"Resume data: {root} ({free:.0f} GiB free). Peak use is about twice the final output.")
+    except OSError:
+        logger.notify(f"Resume data: {root}")
+
+
+# ------------------------------------------------------------ single file ---
+
+def process_file(path: str, opts: Options, gpu: Gpu | None, logger: Logger) -> int:
+    """Convert one file. With -r, a file that already finished is skipped."""
+    try:
+        plan = build_plan(path, None, opts, gpu, logger.log)
+    except ToolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if not opts.resumable:
+        status = encode(plan, opts, logger, path, use_temp=False)
+        if status == 0:
+            announce_outputs(plan, logger)
+        return status
+
+    state = state_root(opts) / f"file-{job_key([path], plan.outputs[0][1], opts)}"
+    done = state / "done.json"
+    if opts.restart and state.exists():
+        shutil.rmtree(state, ignore_errors=True)
+    if done.exists() and all(os.path.exists(p) for _, p in plan.outputs):
+        logger.notify(f"Already converted, skipping: '{path}' (use --restart to redo it)")
+        return 0
+
+    status = encode(plan, opts, logger, path, use_temp=True)
+    if status == 0:
+        state.mkdir(parents=True, exist_ok=True)
+        done.write_text(json.dumps([p for _, p in plan.outputs]))
+        announce_outputs(plan, logger)
+    return status
+
+
+# ---------------------------------------------------------------- combine ---
+
+def abs_path(p: str) -> str:
+    return os.path.join(os.path.realpath(os.path.dirname(p) or "."), os.path.basename(p))
+
+
+def write_concat_list(list_path: Path, paths: list) -> None:
+    with open(list_path, "w", encoding="utf-8") as fh:
+        for p in paths:
+            fh.write(f"file '{quote_for_concat(abs_path(p))}'\n")
+
+
+def run_combine(files: list, opts: Options, gpu: Gpu | None, logger: Logger) -> int:
+    first = files[0]
+    first_name = os.path.basename(first)
+    first_ext = ext_of(first_name)
+
+    for f in files:
+        if is_image_ext(f):
+            print(f"Error: -c/--combine only supports video/audio files, but '{f}' is an image.", file=sys.stderr)
             return 1
-        fi
-    done
 
-    # Work out the output name.
-    if [ -n "$COMBINE_NAME" ]; then
-        stem="$COMBINE_NAME"
-    else
-        stem="${first_name%.*}_combined"
-    fi
+    stem = opts.combine_name or f"{os.path.splitext(first_name)[0]}_combined"
 
-    if [ "$NO_CONVERT" = true ]; then
-        out="${stem}.${first_ext}"
-        CANDIDATES=("$out")
-    else
-        out="${stem}.mov"
-        CANDIDATES=("${stem}.mov" "${stem}.wav" "${stem}_a1.wav" "${stem}_a2.wav" "${stem}_a3.wav" "${stem}_a4.wav")
-    fi
+    if opts.no_convert:
+        out = f"{stem}.{first_ext}"
+        candidates = [out]
+    else:
+        out = f"{stem}.{video_ext(opts)}"
+        candidates = [f"{stem}.mov", f"{stem}.mp4", f"{stem}.wav"] + [f"{stem}_a{n}.wav" for n in range(1, 5)]
 
     # Never overwrite one of the inputs.
-    for cand in "${CANDIDATES[@]}"; do
-        for f in "${FILES[@]}"; do
-            if [ "$cand" -ef "$f" ]; then
-                echo "Error: the combined output '$cand' would overwrite input file '$f'. Pick a different name." >&2
+    for cand in candidates:
+        for f in files:
+            if os.path.exists(cand) and os.path.samefile(cand, f):
+                print(f"Error: the combined output '{cand}' would overwrite input file '{f}'. Pick a different name.",
+                      file=sys.stderr)
                 return 1
-            fi
-        done
-    done
 
-    # Verify the clips share the same stream layout, since concatenation
-    # requires matching codec/resolution/frame rate/audio parameters and the
-    # same number of audio tracks.
-    ref_sig=$(stream_signature "$first_file")
-    for f in "${FILES[@]}"; do
-        sig=$(stream_signature "$f")
-        if [ "$sig" != "$ref_sig" ]; then
-            echo "Error: '$f' does not match the stream layout of '$first_file' (codec, resolution, pixel format, frame rate, audio parameters, or number of audio tracks differ)." >&2
-            echo "All clips must share the same settings to be combined without re-encoding each one first." >&2
+    # Concatenation needs matching codec, resolution, frame rate and audio layout.
+    ref_sig = stream_signature(first)
+    for f in files:
+        if stream_signature(f) != ref_sig:
+            print(f"Error: '{f}' does not match the stream layout of '{first}' (codec, resolution, pixel format, "
+                  "frame rate, audio parameters, or number of audio tracks differ).", file=sys.stderr)
+            print("All clips must share the same settings to be combined without re-encoding each one first.",
+                  file=sys.stderr)
             return 1
-        fi
-    done
 
-    # Build the ffmpeg concat list with absolute paths, in the order given.
-    list_file="$STATUS_DIR/concat.txt"
-    : > "$list_file"
-    sq="'"
-    total_size=0
-    for f in "${FILES[@]}"; do
-        p=$(abs_path "$f") || { echo "Error: could not resolve path for '$f'." >&2; return 1; }
-        esc="${p//$sq/$sq\\$sq$sq}"
-        printf "file '%s'\n" "$esc" >> "$list_file"
-        size=$(get_file_size "$f")
-        total_size=$((total_size + size))
-    done
+    total_size = sum(get_file_size(f) for f in files)
 
-    log "Combining $TOTAL files into '$out' (in the order given):"
-    for f in "${FILES[@]}"; do
-        log "  - $f"
-    done
+    logger.log(f"Combining {len(files)} files into '{out}' (in this order):")
+    for f in files:
+        logger.log(f"  - {f}")
 
-    if [ "$NO_CONVERT" = true ]; then
-        log "--no-convert set. Combining with stream copy only, no DaVinci conversion. All audio tracks are kept as-is."
-        log "ffmpeg -f concat -safe 0 -i \"$list_file\" -map 0:v? -map 0:a? -c copy \"$out\""
-        log "--------------------------------------------------------"
+    if opts.no_convert:
+        return combine_copy_only(files, out, opts, logger)
 
-        local FFMPEG_STATUS=0
-        run_ffmpeg_cmd -f concat -safe 0 -i "$list_file" -map "0:v?" -map "0:a?" -c copy "$out" || FFMPEG_STATUS=$?
+    if opts.resumable:
+        return combine_resumable(files, stem, total_size, opts, gpu, logger)
 
-        if [ "$FFMPEG_STATUS" -ne 0 ]; then
-            trap - ERR
-            echo "Error: ffmpeg failed (exit code $FFMPEG_STATUS) while combining files." >&2
-            if [ "$VERBOSE_LEVEL" -lt 2 ]; then
-                echo "Last few lines of ffmpeg output:" >&2
-                tail -n 10 "$LOG_FILE" >&2
-            fi
-            echo "Full details: $LOG_FILE" >&2
-            return "$FFMPEG_STATUS"
-        fi
+    logger.log("Combining and converting to the target format in a single pass.")
+    with tempfile.TemporaryDirectory(prefix="tovinci-") as tmp:
+        list_file = Path(tmp) / "concat.txt"
+        write_concat_list(list_file, files)
+        try:
+            plan = build_plan(first, stem, opts, gpu, logger.log, str(list_file), total_size)
+        except ToolError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        status = encode(plan, opts, logger, first, use_temp=False)
+    if status == 0:
+        announce_outputs(plan, logger)
+    return status
 
-        log "--------------------------------------------------------"
-        notify "Done! Combined file created: '$out'"
-        return 0
-    fi
 
-    log "Combining and converting to DaVinci format in a single pass."
-    process_one_file "$first_file" "$stem" "$list_file" "$total_size"
-}
+def combine_copy_only(files: list, out: str, opts: Options, logger: Logger) -> int:
+    if opts.resumable:
+        logger.log("--resumable has no effect with --no-convert (a stream copy is quick and not re-encoded).")
+    logger.log("--no-convert set. Combining with stream copy only, no DaVinci conversion. All audio tracks are kept as-is.")
+    with tempfile.TemporaryDirectory(prefix="tovinci-") as tmp:
+        list_file = Path(tmp) / "concat.txt"
+        write_concat_list(list_file, files)
+        plan = Plan([], ["-f", "concat", "-safe", "0", "-i", str(list_file)],
+                    [(["-map", "0:v?", "-map", "0:a?", "-c", "copy"], out)])
+        status = encode(plan, opts, logger, "combine", use_temp=False)
+    if status == 0:
+        logger.notify(f"Done! Combined file created: '{out}'")
+    return status
 
-if [ "$COMBINE" = true ]; then
-    COMBINE_STATUS=0
-    run_combine || COMBINE_STATUS=$?
-    exit "$COMBINE_STATUS"
-fi
 
-declare -a FAILED_FILES=()
-SUCCESS_COUNT=0
+def combine_resumable(files: list, stem: str, total_size: int, opts: Options,
+                      gpu: Gpu | None, logger: Logger) -> int:
+    """Encode each clip to its own part in the work directory, then join the parts
+    with a stream copy. A finished part is never encoded again."""
+    root = state_root(opts)
+    state = root / f"combine-{job_key(files, stem, opts)}"
+    if opts.restart and state.exists():
+        shutil.rmtree(state, ignore_errors=True)
+    state.mkdir(parents=True, exist_ok=True)
+    note_work_dir(root, logger)
 
-i=0
-for f in "${FILES[@]}"; do
-    # Throttle to at most $JOBS concurrent files.
-    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
-        wait -n
-    done
-    (
-        if process_one_file "$f"; then
-            echo 0 > "$STATUS_DIR/$i.status"
-        else
-            echo 1 > "$STATUS_DIR/$i.status"
-        fi
-    ) &
-    i=$((i + 1))
-done
-wait
+    count = len(files)
+    parts: list = []  # parts[k] = output paths of clip k, in plan order
+    try:
+        for idx, clip in enumerate(files):
+            part_stem = str(state / f"part_{idx:04d}")
+            marker = state / f"part_{idx:04d}.done.json"
+            plan = build_plan(clip, part_stem, opts, gpu, logger.log, size_override=total_size)
+            outs = [p for _, p in plan.outputs]
 
-for ((idx = 0; idx < TOTAL; idx++)); do
-    if [ "$(cat "$STATUS_DIR/$idx.status" 2>/dev/null)" = "0" ]; then
-        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-    else
-        FAILED_FILES+=("${FILES[$idx]}")
-    fi
-done
+            if marker.exists() and all(os.path.exists(p) for p in outs):
+                logger.notify(f"[{idx + 1}/{count}] Already encoded, skipping: '{clip}'")
+                parts.append(outs)
+                continue
 
-if [ "$TOTAL" -gt 1 ]; then
-    log "--------------------------------------------------------"
-    if [ "${#FAILED_FILES[@]}" -eq 0 ]; then
-        notify "Done! All $TOTAL file(s) converted successfully."
-    else
-        notify "Finished: $SUCCESS_COUNT/$TOTAL file(s) converted successfully."
-        notify "Failed to convert:"
-        for f in "${FAILED_FILES[@]}"; do
-            notify "  - $f"
-        done
-        echo "See $LOG_FILE for details." >&2
-    fi
-fi
+            logger.notify(f"[{idx + 1}/{count}] Encoding '{clip}'...")
+            status = encode(plan, opts, logger, clip, use_temp=True)
+            if status != 0:
+                print("Re-run the same command to resume from this clip.", file=sys.stderr)
+                return status
+            marker.write_text(json.dumps(outs))
+            parts.append(outs)
 
-if [ "${#FAILED_FILES[@]}" -ne 0 ]; then
-    exit 1
-fi
-exit 0
+        # Same output names as a normal combine, worked out without logging.
+        final_plan = build_plan(files[0], stem, opts, gpu, lambda _m: None, size_override=total_size)
+        finals = [p for _, p in final_plan.outputs]
+
+        logger.notify("All clips encoded. Joining parts (stream copy)...")
+        for j, final in enumerate(finals):
+            list_file = state / f"concat_{j}.txt"
+            write_concat_list(list_file, [part[j] for part in parts])
+            join = Plan([], ["-f", "concat", "-safe", "0", "-i", str(list_file)],
+                        [(["-map", "0", "-c", "copy"], final)])
+            status = encode(join, opts, logger, final, use_temp=True)
+            if status != 0:
+                print("The encoded parts were kept. Re-run the same command to retry the join.", file=sys.stderr)
+                return status
+    except ToolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    announce_outputs(final_plan, logger)
+    if opts.keep_work:
+        logger.notify(f"Work files kept in '{state}'.")
+    else:
+        shutil.rmtree(state, ignore_errors=True)
+    return 0
+
+
+# -------------------------------------------------------------------- CLI ---
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_bool(value: str) -> bool:
+    low = value.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    raise argparse.ArgumentTypeError(f"must be true or false (got '{value}')")
+
+
+def build_parser() -> Parser:
+    p = Parser(prog="tovinci", allow_abbrev=False,
+               formatter_class=argparse.RawDescriptionHelpFormatter,
+               description="Convert media into DaVinci Resolve (Linux) friendly formats.",
+               epilog=EXAMPLES)
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION}",
+                   help="show the version and exit")
+    p.add_argument("-v", dest="verbose", action="count", default=0,
+                   help="-v: step log and brief ffmpeg progress; -vv: full live ffmpeg output")
+    p.add_argument("-t", dest="target_type", default="", metavar="TYPE",
+                   help=f"force an output type: {TYPE_CHOICES}")
+    p.add_argument("--bits", default=None, metavar="N", help="force PCM audio bit depth: 16, 24 or 32")
+    p.add_argument("--threaded", action="store_true", help="force multi-threaded encoding regardless of size")
+    p.add_argument("-j", "--jobs", type=int, default=1, metavar="N", help="process up to N files concurrently")
+    p.add_argument("--use-gpu", type=parse_bool, default=False, metavar="true|false",
+                   help="decode on GPU if a backend is available (use as -use-gpu=true)")
+    p.add_argument("-ca", "--combine-audio", action="store_true", help="mix all audio tracks into one stereo track")
+    p.add_argument("-sa", "--split-audio", action="store_true",
+                   help="video-only output plus one WAV per audio track")
+    p.add_argument("-c", "--combine", action="store_true",
+                   help="combine all inputs into one video first (use as: -c [NAME])")
+    p.add_argument("--combine-name", default="", help=argparse.SUPPRESS)
+    p.add_argument("--no-convert", action="store_true", help="with -c: only combine, skip DaVinci conversion")
+    p.add_argument("--keep-order", action="store_true",
+                   help="with -c: combine in exactly the order given (default: natural order, 1, 2, ... 10)")
+    p.add_argument("-r", "--resumable", action="store_true",
+                   help="make the run resumable: re-run the same command after an interruption")
+    p.add_argument("--restart", action="store_true", help="with -r: discard saved progress and start over")
+    p.add_argument("--keep-work", action="store_true", help="with -r: keep work files after a successful run")
+    p.add_argument("--work-dir", type=Path, default=None, metavar="DIR",
+                   help="with -r: where resume data lives (default ~/.cache/tovinci, never under /mnt/Data)")
+    p.add_argument("inputs", nargs="*", metavar="file_or_pattern")
+    return p
+
+
+def preprocess_argv(argv: list) -> list:
+    """Rewrite the options argparse cannot express: -c [NAME] and -use-gpu=VALUE."""
+    out: list = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            out.extend(argv[i:])
+            break
+        if arg in ("-c", "--combine"):
+            out.append("--combine")
+            if i + 1 < len(argv) and looks_like_name(argv[i + 1]):
+                out.append(f"--combine-name={argv[i + 1]}")
+                i += 1
+        elif arg.startswith("--combine="):
+            out += ["--combine", f"--combine-name={arg.split('=', 1)[1]}"]
+        elif arg.startswith("-use-gpu="):
+            out.append("--use-gpu=" + arg.split("=", 1)[1])
+        else:
+            out.append(arg)
+        i += 1
+    return out
+
+
+def parse_args(argv: list) -> tuple:
+    parser = build_parser()
+    if not argv:
+        parser.print_help()
+        sys.exit(1)
+    ns = parser.parse_intermixed_args(preprocess_argv(argv))
+
+    target = ns.target_type.lower()
+    quality = ""
+    bits = ns.bits
+    if target:
+        if target == "wav":
+            pass
+        elif target in ("wav-16", "wav-24", "wav-32"):
+            bits = target.split("-", 1)[1]
+            target = "wav"
+        elif target == "mp4":
+            pass
+        elif target == "mp4-small":
+            target = "mp4"
+            quality = "small"
+        elif target == "prores":
+            quality = "hq"
+        elif target.startswith("prores-") and target.split("-", 1)[1] in PRORES_PROFILES:
+            quality = target.split("-", 1)[1]
+            target = "prores"
+        else:
+            parser.error(f"unsupported -t type '{ns.target_type}' (supported: {TYPE_CHOICES}).")
+    if bits is not None and str(bits) not in ("16", "24", "32"):
+        parser.error(f"bit depth must be 16, 24 or 32 (got '{bits}').")
+    if target == "mp4" and bits is not None:
+        parser.error("--bits only applies to PCM audio, but mp4 output uses AAC audio.")
+    if ns.jobs < 1:
+        parser.error(f"-j/--jobs must be a positive integer (got '{ns.jobs}').")
+    if ns.no_convert and not ns.combine:
+        parser.error("--no-convert can only be used together with -c/--combine.")
+    if ns.no_convert and target in ("mp4", "prores"):
+        parser.error(f"-t {ns.target_type} cannot be used with --no-convert (the video would need to be re-encoded).")
+    if ns.no_convert and ns.combine_audio:
+        parser.error("-ca/--combine-audio cannot be used with --no-convert (mixing audio requires re-encoding it).")
+    if ns.no_convert and ns.split_audio:
+        parser.error("-sa/--split-audio cannot be used with --no-convert (splitting audio requires re-encoding it).")
+    if ns.combine_audio and ns.split_audio:
+        parser.error("-ca/--combine-audio and -sa/--split-audio contradict each other "
+                     "(mix into one vs. one file per track).")
+    if ns.no_convert and bits is not None:
+        parser.error("a forced bit depth cannot be used with --no-convert (audio is stream-copied untouched).")
+    if ns.keep_order and not ns.combine:
+        parser.error("--keep-order can only be used together with -c/--combine.")
+    if (ns.restart or ns.keep_work or ns.work_dir) and not ns.resumable:
+        parser.error("--restart, --keep-work and --work-dir require -r/--resumable.")
+    if not ns.inputs:
+        parser.print_usage(sys.stderr)
+        sys.exit(1)
+
+    combine_name = ns.combine_name
+    if combine_name and has_media_ext(combine_name):
+        combine_name = os.path.splitext(combine_name)[0]
+
+    opts = Options(verbose=ns.verbose, target_type=target, quality=quality,
+                   bits=str(bits) if bits is not None else None,
+                   threaded=ns.threaded, jobs=ns.jobs, gpu_requested=ns.use_gpu, combine=ns.combine,
+                   combine_name=combine_name, no_convert=ns.no_convert, combine_audio=ns.combine_audio,
+                   split_audio=ns.split_audio, resumable=ns.resumable, keep_order=ns.keep_order,
+                   restart=ns.restart,
+                   keep_work=ns.keep_work, work_dir=ns.work_dir)
+    return opts, ns.inputs
+
+
+def resolve_files(patterns: list) -> list:
+    files: list = []
+    for arg in patterns:
+        if os.path.isfile(arg):
+            files.append(arg)
+        elif has_glob_chars(arg):
+            matches = sorted(glob.glob(arg))
+            if matches:
+                files.extend(m for m in matches if os.path.isfile(m))
+            else:
+                print(f"Warning: pattern '{arg}' matched no files - skipping.", file=sys.stderr)
+        else:
+            print(f"Warning: file '{arg}' not found - skipping.", file=sys.stderr)
+    return files
+
+
+def main(argv: list | None = None) -> int:
+    opts, patterns = parse_args(sys.argv[1:] if argv is None else argv)
+
+    files = resolve_files(patterns)
+    if not files:
+        print("Error: no valid input files found.", file=sys.stderr)
+        return 1
+    total = len(files)
+
+    if opts.combine:
+        if total < 2:
+            print(f"Error: -c/--combine needs at least 2 valid input files (found {total}).", file=sys.stderr)
+            return 1
+        opts.jobs = 1  # combining produces one output, so concurrency does not apply
+
+    gpu = None
+    if opts.gpu_requested and not opts.no_convert:
+        gpu = detect_gpu()
+        if gpu:
+            print(f"GPU-accelerated decode enabled (backend: {gpu.backend}). Encoding itself still runs "
+                  "on the CPU.", file=sys.stderr)
+        else:
+            print("Warning: -use-gpu=true requested, but no usable GPU decode backend was detected "
+                  "(checked cuda/vaapi/qsv). Falling back to CPU decoding.", file=sys.stderr)
+
+    log_path = setup_log_path()
+    rotate_log(log_path)
+    logger = Logger(log_path, opts.verbose)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        if opts.combine:
+            logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: combine {total} files ===")
+            files = order_for_combine(files, opts, logger)
+            return run_combine(files, opts, gpu, logger)
+
+        if total == 1:
+            logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: '{files[0]}' ===")
+        else:
+            logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: {total} files (jobs={opts.jobs}) ===")
+
+        def job(f: str) -> int:
+            prefix = f"[{os.path.basename(f)}] " if opts.jobs > 1 else ""
+            try:
+                return process_file(f, opts, gpu, logger.child(prefix))
+            except ToolError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        with ThreadPoolExecutor(max_workers=opts.jobs) as pool:
+            results = list(pool.map(job, files))
+
+        failed = [f for f, rc in zip(files, results) if rc != 0]
+        if total > 1:
+            logger.log(RULE)
+            if not failed:
+                logger.notify(f"Done! All {total} file(s) converted successfully.")
+            else:
+                logger.notify(f"Finished: {total - len(failed)}/{total} file(s) converted successfully.")
+                logger.notify("Failed to convert:")
+                for f in failed:
+                    logger.notify(f"  - {f}")
+                print(f"See {log_path} for details.", file=sys.stderr)
+        return 1 if failed else 0
+
+    except ToolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        if opts.resumable:
+            print("Re-run the same command to resume.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
