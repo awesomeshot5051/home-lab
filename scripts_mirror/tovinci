@@ -7,9 +7,16 @@ high-quality JPEG. With -t, videos can instead become a much smaller H.264/AAC
 .mp4 (mp4, mp4-small) or ProRes in a .mov (prores, prores-422, prores-lt,
 prores-proxy). Several clips can be combined into one output in a single
 pass (-c), audio tracks can be mixed (-ca) or written as separate WAVs (-sa),
-and long jobs can be resumed after an interruption (-r).
+and long jobs can be resumed after an interruption (-r). A dry run (-n) estimates
+the output size without writing any output files, and -o sends the results to a
+directory of your choice.
 
 Changelog:
+  2.5.0  Added -o/--output-dir: write every output file into a chosen directory
+         (created if missing). Batch runs refuse to start if two inputs would collide
+         on the same output name. The dry run checks free space at that location.
+  2.4.0  Added -n/--dry-run: estimates the final output size (per clip and total) by
+         encoding a few short samples, without creating any output files.
   2.3.0  Restored the -t video types: mp4, mp4-small, prores, prores-hq, prores-422,
          prores-lt, prores-proxy (they had been lost from the Python rewrite).
   2.2.0  Added --version / -V.
@@ -37,11 +44,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.3.0"
+VERSION = "2.5.0"
 RUN_MARKER = "=== RUN START"
 AUTO_THREAD_BYTES = 10 * 1024 * 1024 * 1024  # 10GB auto-threading threshold
 FORBIDDEN_CACHE_ROOT = "/mnt/Data"  # resume data must never live on the secondary drive
 RULE = "-" * 56
+
+DRY_RUN_WINDOWS = 3        # number of sample windows taken per clip
+DRY_RUN_SECONDS = 4.0      # length of each sample window in seconds
 
 MP4_CRF = "18"        # visually near-lossless
 MP4_CRF_SMALL = "23"  # noticeably smaller, still good quality
@@ -86,6 +96,10 @@ examples:
   tovinci -c --keep-order Name b.mov a.mov    combine in exactly the order given
   tovinci -c Name --no-convert a.mov b.mov    combine only, no conversion
   tovinci -r -c -sa Name a.mov b.mov          resumable combine (re-run the same command to resume)
+  tovinci -n -c Name a.mov b.mov              dry run: estimate the combined size, write nothing
+  tovinci -n -t mp4 *.mov                     dry run: estimate each file's size as mp4
+  tovinci -o /path/to/out *.mov               write every converted file into /path/to/out
+  tovinci -c Name -o /path/to/out a.mov b.mov combine -> /path/to/out/Name.mov
 
 types (-t):
   wav, wav-16, wav-24, wav-32     audio-only WAV (the number forces the PCM bit depth)
@@ -113,6 +127,22 @@ resume (-r):
   finished. A clip that was mid-encode when interrupted is redone from its start.
   The work directory defaults to ~/.cache/tovinci and may never be under /mnt/Data.
   Peak disk use is roughly twice the final output (the parts plus the joined file).
+
+dry run (-n):
+  Nothing is written to the output location. For each clip, a few short sample windows are
+  encoded with the exact settings a real run would use (into a temporary folder inside the
+  work directory, deleted afterward), the size per second is measured, and that is scaled to
+  the clip's full duration. DNxHR is close to constant bitrate, so its estimate is tight;
+  mp4 and ProRes vary with content, so treat those as a ballpark. Combine with -c to see the
+  size of the combined file, and with -t to compare formats. Free disk space is reported too.
+
+output location (-o):
+  -o DIR puts every output file (the converted video, JPEG or WAV, split audio WAVs, and the
+  combined file) in DIR, which is created if it does not exist. Without -o, outputs go in the
+  current directory as before. The in-progress .partial files used by -r live in DIR as well,
+  so the final rename is instant. Resume data and dry-run samples stay in the work directory
+  (default ~/.cache/tovinci), not in DIR. In a batch, two inputs that would produce the same
+  output name (same file name in different folders) are refused, so nothing is overwritten.
 """
 
 
@@ -139,6 +169,8 @@ class Options:
     restart: bool = False
     keep_work: bool = False
     work_dir: Path | None = None
+    dry_run: bool = False
+    output_dir: Path | None = None
 
 
 @dataclass
@@ -309,6 +341,75 @@ def video_ext(opts: Options) -> str:
     return "mp4" if opts.target_type == "mp4" else "mov"
 
 
+def human_size(num: float) -> str:
+    """Bytes as a short human-readable string (binary units)."""
+    value = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} TiB"
+
+
+def human_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+# ------------------------------------------------------- output location ---
+
+def out_stem(name: str, opts: Options) -> str:
+    """Place an output stem (no extension) inside the output directory, if one was given."""
+    if opts.output_dir is None:
+        return name
+    return str(opts.output_dir / name)
+
+
+def default_stem(input_file: str, opts: Options) -> str:
+    """Default output stem for a single converted file: <name>_davinci in the output location."""
+    return out_stem(f"{os.path.splitext(os.path.basename(input_file))[0]}_davinci", opts)
+
+
+def existing_parent(path: Path) -> Path:
+    """Nearest parent of path that exists (used for free-space checks on a directory
+    that has not been created yet)."""
+    p = path.absolute()
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return p
+
+
+def prepare_output_dir(opts: Options) -> None:
+    """Create the output directory if needed and make sure it can be written to."""
+    d = opts.output_dir
+    if d is None:
+        return
+    if d.exists() and not d.is_dir():
+        raise ToolError(f"--output-dir '{d}' exists but is not a directory.")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ToolError(f"could not create output directory '{d}': {exc}")
+    if not os.access(d, os.W_OK):
+        raise ToolError(f"output directory '{d}' is not writable.")
+
+
+def check_output_collisions(files: list, opts: Options) -> None:
+    """With a shared output directory, two inputs with the same file name from different
+    folders would overwrite each other. Refuse before encoding anything."""
+    if opts.output_dir is None:
+        return
+    seen: dict = {}
+    for f in files:
+        key = (os.path.splitext(os.path.basename(f))[0], "image" if is_image_ext(f) else "av")
+        if key in seen and os.path.abspath(seen[key]) != os.path.abspath(f):
+            raise ToolError(f"'{seen[key]}' and '{f}' would both write to the same output name in "
+                            f"'{opts.output_dir}'. Convert them separately or rename one.")
+        seen.setdefault(key, f)
+
+
 # ----------------------------------------------------------------- probing ---
 
 def ffprobe(*args: str) -> str:
@@ -323,6 +424,15 @@ def ffprobe(*args: str) -> str:
 def probe_value(path: str, stream: str, entries: str) -> str:
     return ffprobe("-select_streams", stream, "-show_entries", f"stream={entries}",
                    "-of", "default=nk=1:nw=1", path)
+
+
+def probe_duration(path: str) -> float:
+    """Container duration in seconds, or 0.0 if it cannot be read."""
+    out = ffprobe("-show_entries", "format=duration", "-of", "default=nk=1:nw=1", path)
+    try:
+        return max(float(out), 0.0)
+    except ValueError:
+        return 0.0
 
 
 def count_audio(path: str) -> int:
@@ -470,7 +580,7 @@ def build_plan(input_file: str, stem: str | None, opts: Options, gpu: Gpu | None
     log(f"Analyzing '{input_file}'...")
 
     if stem is None:
-        stem = f"{os.path.splitext(os.path.basename(input_file))[0]}_davinci"
+        stem = default_stem(input_file, opts)
 
     pre: list = []
     if concat_list:
@@ -722,6 +832,182 @@ def note_work_dir(root: Path, logger: Logger) -> None:
         logger.notify(f"Resume data: {root}")
 
 
+# --------------------------------------------------------------- dry run ---
+
+def encode_sample(plan: Plan, pos: float | None, length: float | None, opts: Options,
+                  logger: Logger, tmp: str, tag: str) -> int | None:
+    """Encode one short window of a clip with the plan's exact settings and return the
+    total bytes written across all of the plan's outputs (None on failure). The sample
+    files go into tmp and are deleted right away."""
+    targets = []
+    for j, (_, final) in enumerate(plan.outputs):
+        targets.append(os.path.join(tmp, f"{tag}_{j}{os.path.splitext(final)[1]}"))
+
+    def assemble(pre: list) -> list:
+        args = list(pre)
+        if pos is not None:
+            args += ["-ss", f"{pos:.3f}"]
+        args += list(plan.inp)
+        for (oargs, _), target in zip(plan.outputs, targets):
+            if length is not None:
+                args += ["-t", f"{length:.3f}"]
+            args += list(oargs) + [target]
+        return args
+
+    logger.log(shlex.join(["ffmpeg"] + assemble(plan.pre)))
+    try:
+        status = run_ffmpeg(assemble(plan.pre), opts, logger)
+        if status != 0 and plan.pre:
+            logger.log(f"GPU-accelerated decode failed (exit code {status}) during sampling. Retrying with CPU decode...")
+            status = run_ffmpeg(assemble([]), opts, logger)
+    except BaseException:
+        discard(targets)
+        raise
+
+    size = sum(get_file_size(t) for t in targets) if status == 0 else None
+    discard(targets)
+    return size
+
+
+def sample_positions(duration: float) -> list | None:
+    """Start times for the sample windows, or None if the clip is short enough to
+    just encode in full (which makes its estimate exact)."""
+    if duration <= DRY_RUN_WINDOWS * DRY_RUN_SECONDS * 2:
+        return None
+    span = duration - DRY_RUN_SECONDS
+    if DRY_RUN_WINDOWS == 1:
+        return [span / 2]
+    return [span * i / (DRY_RUN_WINDOWS - 1) for i in range(DRY_RUN_WINDOWS)]
+
+
+def estimate_clip(clip: str, opts: Options, gpu: Gpu | None, logger: Logger, tmp: str,
+                  tag: str, size_override: int | None) -> dict:
+    """Estimate the output size for one clip. Returns a dict with keys: bytes (or None),
+    duration, exact (bool) and note (str)."""
+    plan = build_plan(clip, "sample", opts, gpu, logger.log, size_override=size_override)
+
+    if is_image_ext(clip):
+        size = encode_sample(plan, None, None, opts, logger, tmp, tag)
+        return {"bytes": size, "duration": 0.0, "exact": True,
+                "note": "" if size is not None else "image conversion failed"}
+
+    duration = probe_duration(clip)
+    if duration <= 0:
+        return {"bytes": None, "duration": 0.0, "exact": False,
+                "note": "could not read the duration"}
+
+    positions = sample_positions(duration)
+    if positions is None:
+        size = encode_sample(plan, None, None, opts, logger, tmp, tag)
+        return {"bytes": size, "duration": duration, "exact": True,
+                "note": "" if size is not None else "sample encode failed"}
+
+    total_bytes = 0
+    total_secs = 0.0
+    for n, pos in enumerate(positions):
+        size = encode_sample(plan, pos, DRY_RUN_SECONDS, opts, logger, tmp, f"{tag}_{n}")
+        if size is None:
+            return {"bytes": None, "duration": duration, "exact": False,
+                    "note": "sample encode failed"}
+        total_bytes += size
+        total_secs += DRY_RUN_SECONDS
+    return {"bytes": total_bytes / total_secs * duration, "duration": duration,
+            "exact": False, "note": ""}
+
+
+def run_dry_run(files: list, opts: Options, gpu: Gpu | None, logger: Logger, combine: bool) -> int:
+    """Estimate output sizes without writing any output files."""
+    count = len(files)
+    total_in = sum(get_file_size(f) for f in files)
+
+    if combine:
+        for f in files:
+            if is_image_ext(f):
+                print(f"Error: -c/--combine only supports video/audio files, but '{f}' is an image.", file=sys.stderr)
+                return 1
+        ref_sig = stream_signature(files[0])
+        for f in files[1:]:
+            if stream_signature(f) != ref_sig:
+                print(f"Warning: '{f}' does not match the stream layout of '{files[0]}'. A real combine "
+                      "would fail on this.", file=sys.stderr)
+
+    if combine and opts.no_convert:
+        logger.notify("Dry run (nothing is written): --no-convert is a stream copy, so the combined file "
+                      "will be about the size of the inputs.")
+        report_dry_run([(f, {"bytes": get_file_size(f), "duration": probe_duration(f),
+                             "exact": True, "note": ""}) for f in files], total_in, opts, combine)
+        return 0
+
+    logger.notify(f"Dry run (nothing is written): sampling {count} file(s), "
+                  f"{DRY_RUN_WINDOWS} x {DRY_RUN_SECONDS:.0f}s per clip...")
+
+    results: list = []
+    root = state_root(opts)  # sample files stay on the primary drive, never under /mnt/Data
+    size_override = total_in if combine else None
+    with tempfile.TemporaryDirectory(prefix="dryrun-", dir=str(root)) as tmp:
+        for idx, clip in enumerate(files):
+            logger.notify(f"[{idx + 1}/{count}] Sampling '{clip}'...")
+            try:
+                res = estimate_clip(clip, opts, gpu, logger, tmp, f"c{idx:04d}", size_override)
+            except ToolError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                res = {"bytes": None, "duration": 0.0, "exact": False, "note": str(exc)}
+            results.append((clip, res))
+
+    report_dry_run(results, total_in, opts, combine)
+    return 1 if any(r["bytes"] is None for _, r in results) else 0
+
+
+def report_dry_run(results: list, total_in: int, opts: Options, combine: bool) -> None:
+    print()
+    print("Dry run estimate (no output files were created)")
+    print(RULE)
+    est_total = 0.0
+    dur_total = 0.0
+    unknown = 0
+    all_exact = True
+    for clip, res in results:
+        name = os.path.basename(clip)
+        if res["bytes"] is None:
+            unknown += 1
+            print(f"  {name}: unknown ({res['note']})")
+            continue
+        est_total += res["bytes"]
+        dur_total += res["duration"]
+        all_exact = all_exact and res["exact"]
+        dur = human_duration(res["duration"]) if res["duration"] else "image"
+        tag = "exact" if res["exact"] else "est."
+        print(f"  {name}: {dur}  {human_size(res['bytes'])} ({tag})")
+    print(RULE)
+
+    if combine:
+        print(f"Combined output: about {human_size(est_total)} "
+              f"over {human_duration(dur_total)}")
+    else:
+        print(f"All outputs together: about {human_size(est_total)}")
+    if total_in:
+        ratio = est_total / total_in
+        print(f"Inputs total: {human_size(total_in)} (output is about {ratio:.1f}x the input size)")
+    if unknown:
+        print(f"Note: {unknown} file(s) could not be estimated and are not included in the total.")
+    if not all_exact:
+        print("Estimates come from short samples; DNxHR is close to constant bitrate, while mp4 and "
+              "ProRes vary with content.")
+
+    try:
+        target = opts.output_dir if opts.output_dir is not None else Path.cwd()
+        free = shutil.disk_usage(existing_parent(target)).free
+        where = f"'{opts.output_dir}'" if opts.output_dir is not None else "the current directory"
+        print(f"Free space at {where}: {human_size(free)}")
+        needed = est_total * 2 if (combine and opts.resumable and not opts.no_convert) else est_total
+        if opts.resumable and combine and not opts.no_convert:
+            print(f"With -r, peak disk use is about twice the output: roughly {human_size(needed)}.")
+        if needed > free:
+            print("Warning: this is more than the free space available there.")
+    except OSError:
+        pass
+
+
 # ------------------------------------------------------------ single file ---
 
 def process_file(path: str, opts: Options, gpu: Gpu | None, logger: Logger) -> int:
@@ -776,7 +1062,7 @@ def run_combine(files: list, opts: Options, gpu: Gpu | None, logger: Logger) -> 
             print(f"Error: -c/--combine only supports video/audio files, but '{f}' is an image.", file=sys.stderr)
             return 1
 
-    stem = opts.combine_name or f"{os.path.splitext(first_name)[0]}_combined"
+    stem = out_stem(opts.combine_name or f"{os.path.splitext(first_name)[0]}_combined", opts)
 
     if opts.no_convert:
         out = f"{stem}.{first_ext}"
@@ -953,6 +1239,11 @@ def build_parser() -> Parser:
     p.add_argument("--keep-work", action="store_true", help="with -r: keep work files after a successful run")
     p.add_argument("--work-dir", type=Path, default=None, metavar="DIR",
                    help="with -r: where resume data lives (default ~/.cache/tovinci, never under /mnt/Data)")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="estimate the output size (per file, or combined with -c) from short samples "
+                        "without writing any output files")
+    p.add_argument("-o", "--output-dir", type=Path, default=None, metavar="DIR",
+                   help="write all output files into DIR (created if missing); default is the current directory")
     p.add_argument("inputs", nargs="*", metavar="file_or_pattern")
     return p
 
@@ -1040,13 +1331,16 @@ def parse_args(argv: list) -> tuple:
     if combine_name and has_media_ext(combine_name):
         combine_name = os.path.splitext(combine_name)[0]
 
+    output_dir = ns.output_dir.expanduser() if ns.output_dir is not None else None
+
     opts = Options(verbose=ns.verbose, target_type=target, quality=quality,
                    bits=str(bits) if bits is not None else None,
                    threaded=ns.threaded, jobs=ns.jobs, gpu_requested=ns.use_gpu, combine=ns.combine,
                    combine_name=combine_name, no_convert=ns.no_convert, combine_audio=ns.combine_audio,
                    split_audio=ns.split_audio, resumable=ns.resumable, keep_order=ns.keep_order,
                    restart=ns.restart,
-                   keep_work=ns.keep_work, work_dir=ns.work_dir)
+                   keep_work=ns.keep_work, work_dir=ns.work_dir, dry_run=ns.dry_run,
+                   output_dir=output_dir)
     return opts, ns.inputs
 
 
@@ -1097,15 +1391,25 @@ def main(argv: list | None = None) -> int:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
+        if not opts.dry_run:
+            prepare_output_dir(opts)  # a dry run writes nothing, so it never creates the directory
+
         if opts.combine:
             logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: combine {total} files ===")
             files = order_for_combine(files, opts, logger)
+            if opts.dry_run:
+                return run_dry_run(files, opts, gpu, logger, combine=True)
             return run_combine(files, opts, gpu, logger)
 
         if total == 1:
             logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: '{files[0]}' ===")
         else:
             logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: {total} files (jobs={opts.jobs}) ===")
+
+        if opts.dry_run:
+            return run_dry_run(files, opts, gpu, logger, combine=False)
+
+        check_output_collisions(files, opts)
 
         def job(f: str) -> int:
             prefix = f"[{os.path.basename(f)}] " if opts.jobs > 1 else ""
