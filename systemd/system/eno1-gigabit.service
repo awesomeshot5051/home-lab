@@ -1,0 +1,11 @@
+[Unit]
+Description=Advertise only 1000baseT/Full on eno1
+After=sys-subsystem-net-devices-eno1.device
+Wants=sys-subsystem-net-devices-eno1.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -s eno1 advertise 0x020
+
+[Install]
+WantedBy=multi-user.target
