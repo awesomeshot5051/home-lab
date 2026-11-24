@@ -1,11 +1,11 @@
 [Unit]
-Description=Mount unit for snapd, revision 27738
+Description=Mount unit for snapd, revision 28332
 After=snapd.mounts-pre.target
 Before=snapd.mounts.target
 
 [Mount]
-What=/var/lib/snapd/snaps/snapd_27738.snap
-Where=/snap/snapd/27738
+What=/var/lib/snapd/snaps/snapd_28332.snap
+Where=/snap/snapd/28332
 Type=squashfs
 Options=nodev,ro,x-gdu.hide,x-gvfs-hide
 LazyUnmount=yes
