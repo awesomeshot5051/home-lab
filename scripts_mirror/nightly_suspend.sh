@@ -33,6 +33,14 @@ if systemd-inhibit --list --no-legend 2>/dev/null | grep -q 'monthly-backup'; th
     exit 0
 fi
 
+# 4. An NFS client is still connected (a mounted client keeps a connection open
+#    even when idle, and a server that sleeps under it hangs the client)
+NFS_CLIENTS=$(ss -Htn state established '( sport = :2049 )' 2>/dev/null | wc -l)
+if [ "$NFS_CLIENTS" -gt 0 ]; then
+    log "Suspend skipped: ${NFS_CLIENTS} NFS client connection(s) established."
+    exit 0
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
     log "Dry run: would suspend for ${SLEEP_SECONDS} seconds."
     exit 0

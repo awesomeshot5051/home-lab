@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Usage:
+#   sudo bash zfs_reclaim.sh               report only (includes a dry run of what a delete would free)
+#   sudo bash zfs_reclaim.sh --delete      delete all snapshots except the newest 2 in each raw dataset
+# Targets only the child datasets under PARENT. The pool root and all other datasets are never touched.
+# After deleting, it shows progress while ZFS frees the space. Ctrl-C is safe:
+# ZFS keeps freeing in the background.
+set -uo pipefail
+
+POOL="storage"
+PARENT="storage/raw"
+KEEP=2
+DELETE=0
+for a in "$@"; do
+    case "$a" in
+        --delete) DELETE=1 ;;
+        *) echo "Unknown option: $a"; exit 1 ;;
+    esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Run as root: sudo bash $0"
+    exit 1
+fi
+
+if ! zfs list -H -o name "$PARENT" > /dev/null 2>&1; then
+    echo "Dataset $PARENT not found."
+    exit 1
+fi
+
+show_usage() {
+    echo "Pool space:"
+    zfs list -o name,used,avail,refer "$POOL"
+    echo "Pool freeing (pending async frees): $(zpool get -H -o value freeing "$POOL" 2> /dev/null)"
+}
+
+list_snaps() {
+    zfs list -H -t snapshot -d 1 -o name -s creation "$1" 2> /dev/null
+}
+
+wait_for_free() {
+    trap 'echo; echo "Interrupted. ZFS keeps freeing space in the background."; show_usage; exit 130' INT
+    local pending
+    while :; do
+        pending=$(zpool get -H -o value freeing "$POOL" 2> /dev/null)
+        if [[ -z "$pending" || "$pending" == "0" ]]; then
+            break
+        fi
+        printf '%s  still freeing: %s | avail: %s\n' \
+            "$(date +%H:%M:%S)" "$pending" \
+            "$(zfs list -H -o avail "$POOL")"
+        sleep 10
+    done
+    trap - INT
+}
+
+mapfile -t DATASETS < <(zfs list -H -o name -t filesystem -r "$PARENT" | grep -vxF "$PARENT")
+
+if (( ${#DATASETS[@]} == 0 )); then
+    echo "No child datasets found under $PARENT."
+    exit 0
+fi
+
+show_usage
+echo
+echo "Datasets targeted (${#DATASETS[@]}):"
+printf '  %s\n' "${DATASETS[@]}"
+
+for ds in "${DATASETS[@]}"; do
+    mapfile -t SN < <(list_snaps "$ds")
+    cnt=${#SN[@]}
+    echo
+    echo "=== $ds ==="
+    echo "Space held only by snapshots: $(zfs get -H -o value usedbysnapshots "$ds")"
+    echo "Snapshots: $cnt"
+    if (( cnt > 0 )); then
+        zfs list -t snapshot -d 1 -o name,used,refer,creation -s creation "$ds"
+    fi
+    if (( cnt > KEEP )); then
+        first=${SN[0]#*@}
+        last=${SN[$((cnt-KEEP-1))]#*@}
+        echo
+        echo "Dry run, deleting $((cnt-KEEP)) oldest (keeping the newest $KEEP):"
+        zfs destroy -nv "${ds}@${first}%${last}" 2>&1 | tail -n 3
+    fi
+done
+
+echo
+if [[ -f /etc/sanoid/sanoid.conf ]]; then
+    echo "Sanoid retention lines (/etc/sanoid/sanoid.conf):"
+    grep -nE '^\[|autosnap|autoprune|hourly|daily|weekly|monthly|yearly' /etc/sanoid/sanoid.conf
+else
+    echo "No /etc/sanoid/sanoid.conf found. Check what creates your snapshots (cron, systemd timers, other tool)."
+fi
+
+if (( DELETE )); then
+    echo
+    for ds in "${DATASETS[@]}"; do
+        mapfile -t SN < <(list_snaps "$ds")
+        cnt=${#SN[@]}
+        if (( cnt <= KEEP )); then
+            echo "$ds: $cnt snapshots, nothing to delete"
+            continue
+        fi
+        first=${SN[0]#*@}
+        last=${SN[$((cnt-KEEP-1))]#*@}
+        echo "$ds: deleting $((cnt-KEEP)) of $cnt snapshots (${first} through ${last})"
+        echo "$ds: keeping the newest $KEEP (${SN[*]: -$KEEP})"
+        zfs destroy -v "${ds}@${first}%${last}" \
+            || echo "  failed for $ds (holds or clones? check: zfs holds -r $ds)"
+    done
+
+    echo
+    echo "Waiting for ZFS to free the space (Ctrl-C is safe)..."
+    wait_for_free
+
+    echo
+    show_usage
+fi
